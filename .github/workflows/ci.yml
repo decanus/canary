@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.22.x", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -race ./...
+      - name: Conformance vectors
+        run: go run ./cmd/canary vectors
+
+  fuzz:
+    name: Fuzz (short)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Fuzz
+        run: |
+          for f in FuzzValidateBlock FuzzBlockRoundTrip FuzzHeaderRoundTrip; do
+            go test ./internal/consensus -run '^$' -fuzz "^$f\$" -fuzztime 20s
+          done
+
+  reference:
+    name: Python reference cross-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify vector chain with both implementations
+        run: |
+          python3 -c "import json; v = json.load(open('reference/test_vectors.json')); json.dump({'params': v['params'], 'blocks': v['chain']['blocks']}, open('chain.json', 'w'))"
+          python3 reference/canary.py verify chain.json | tee py.txt
+          go run ./cmd/canary verify chain.json | tee go.txt
+          diff py.txt go.txt
