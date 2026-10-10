@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/decanus/canary/internal/consensus"
 )
@@ -91,7 +92,8 @@ func Load(path string) (*consensus.Params, []*consensus.Block, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	var f File
+	// Missing params keys keep the reference defaults (Python's Params dataclass), not zero.
+	f := File{Params: consensus.Prototype}
 	if err := json.Unmarshal(data, &f); err != nil {
 		return nil, nil, err
 	}
@@ -128,5 +130,30 @@ func Save(path string, p *consensus.Params, blocks []*consensus.Block) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o644)
+	return writeFileAtomic(path, append(data, '\n'))
+}
+
+// writeFileAtomic writes data to a temporary file in path's directory and renames it over path,
+// so a crash leaves either the old file or the new one.
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }

@@ -44,20 +44,20 @@ var Prototype = Params{
 }
 
 // Mainnet is defined but not the default.
-var Mainnet = Params{
-	Tau:           600,
-	Epoch:         2016,
-	GenesisBits:   64,
-	MinBits:       32,
-	MaxBits:       240,
-	MaxCurveCtr:   1 << 20,
-	MaxStep:       4,
-	TimewarpSlack: 600,
-	MTPWindow:     11,
-	FutureLimit:   7200,
-	Magic:         0xCA4A2700,
-	P2PPort:       8555,
-	APIPort:       8556,
+var Mainnet = func() Params {
+	p := Prototype
+	p.Tau, p.Epoch, p.GenesisBits = 600, 2016, 64
+	p.Magic, p.P2PPort, p.APIPort = 0xCA4A2700, 8555, 8556
+	return p
+}()
+
+// SameConsensus reports whether p and q agree on every consensus parameter (network settings
+// are ignored).
+func (p *Params) SameConsensus(q *Params) bool {
+	a, b := *p, *q
+	a.Magic, a.P2PPort, a.APIPort = 0, 0, 0
+	b.Magic, b.P2PPort, b.APIPort = 0, 0, 0
+	return a == b
 }
 
 // Validate rejects parameter sets the consensus code cannot run with (for example params read

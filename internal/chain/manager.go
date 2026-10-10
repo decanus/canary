@@ -16,9 +16,10 @@ const MaxOrphans = 100
 // Status is the outcome of AddBlock.
 type Status int
 
+// The zero Status accompanies an error, so it is never mistaken for an outcome.
 const (
 	// Duplicate: the block is already known (in the index or the orphan pool).
-	Duplicate Status = iota
+	Duplicate Status = iota + 1
 	// Orphan: the parent is unknown; the block waits in the orphan pool.
 	Orphan
 	// SideChain: the block is valid and stored but did not become the tip.
@@ -28,7 +29,17 @@ const (
 )
 
 func (s Status) String() string {
-	return [...]string{"duplicate", "orphan", "side-chain", "new-tip"}[s]
+	switch s {
+	case Duplicate:
+		return "duplicate"
+	case Orphan:
+		return "orphan"
+	case SideChain:
+		return "side-chain"
+	case NewTip:
+		return "new-tip"
+	}
+	return "error"
 }
 
 // TipEvent announces a change of the active tip.
@@ -55,8 +66,9 @@ type Manager struct {
 	subs    []chan TipEvent
 }
 
-// Open opens the data directory and rebuilds the index by replaying the stored blocks through
-// validation (without the future-time rule).
+// Open opens the data directory for writing and rebuilds the index by replaying the stored
+// blocks through validation (without the future-time rule). The directory's recorded params
+// must match p; a new directory records p.
 func Open(dir string, p *consensus.Params) (*Manager, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -65,19 +77,43 @@ func Open(dir string, p *consensus.Params) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	m, err := replay(p, blocks)
+	if err == nil {
+		err = checkParams(dir, p)
+	}
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	m.store = store
+	return m, nil
+}
+
+// OpenReadOnly rebuilds an in-memory manager from dir with its recorded params, without
+// modifying the directory. The result has no store, so added blocks are not persisted.
+func OpenReadOnly(dir string) (*Manager, error) {
+	p, err := ReadParams(dir)
+	if err != nil {
+		return nil, err
+	}
+	blocks, err := ReadStore(dir)
+	if err != nil {
+		return nil, err
+	}
+	return replay(p, blocks)
+}
+
+func replay(p *consensus.Params, blocks []*consensus.Block) (*Manager, error) {
 	m := newManager(p)
 	for i, blk := range blocks {
 		if _, err := m.add(blk, nil, false); err != nil {
-			store.Close()
 			return nil, fmt.Errorf("replaying stored block %d: %w", i, err)
 		}
 	}
 	// Stored blocks are written only once connected, so a replay leaves no orphans.
 	if len(m.orphans) != 0 {
-		store.Close()
 		return nil, fmt.Errorf("%d stored blocks have unknown parents", len(m.orphans))
 	}
-	m.store = store
 	return m, nil
 }
 
@@ -121,7 +157,7 @@ func (m *Manager) AddBlock(blk *consensus.Block, now int64) (Status, error) {
 }
 
 func (m *Manager) add(blk *consensus.Block, now *int64, persist bool) (Status, error) {
-	if blk == nil || blk.Header == nil {
+	if !blk.WellFormed() {
 		return 0, fmt.Errorf("%w: malformed block", consensus.ErrInvalid)
 	}
 	hash := blk.Hash()
@@ -143,9 +179,11 @@ func (m *Manager) add(blk *consensus.Block, now *int64, persist bool) (Status, e
 		return status, err
 	}
 
-	// Connect orphans that were waiting on this block, breadth first.
+	// Connect orphans that were waiting on this block, breadth first. An invalid orphan is
+	// dropped (it does not make its parent invalid); any other failure, such as a storage
+	// error, puts it back in the pool and is reported.
 	queue := [][32]byte{hash}
-	for len(queue) > 0 {
+	for len(queue) > 0 && err == nil {
 		ph := queue[0]
 		queue = queue[1:]
 		children := m.waiting[ph]
@@ -156,18 +194,20 @@ func (m *Manager) add(blk *consensus.Block, now *int64, persist bool) (Status, e
 				continue // evicted
 			}
 			m.removeOrphan(ch)
-			// An invalid orphan is dropped; it does not make its parent invalid.
-			if _, err := m.connect(ch, ob, m.index[ph], now, persist); err == nil {
+			if _, cerr := m.connect(ch, ob, m.index[ph], now, persist); cerr == nil {
 				queue = append(queue, ch)
+			} else if !errors.Is(cerr, consensus.ErrInvalid) {
+				m.addOrphan(ch, ob)
+				err = fmt.Errorf("connecting orphan %x: %w", ch[:8], cerr)
 			}
 		}
 	}
 
 	if m.tip() != oldTip {
 		m.notify(oldTip)
-		return NewTip, nil
+		status = NewTip
 	}
-	return status, nil
+	return status, err
 }
 
 // connect validates blk on top of parent, stores it and switches the tip if it has more work.
@@ -196,7 +236,7 @@ func (m *Manager) connect(hash [32]byte, blk *consensus.Block, parent *node, now
 // setTip makes n the active tip, rewriting the active chain above the fork point.
 func (m *Manager) setTip(n *node) {
 	path := []*node{}
-	for c := n; c != nil && !(c.height < len(m.active) && m.active[c.height] == c); c = c.parent {
+	for c := n; c != nil && !onActive(m.active, c); c = c.parent {
 		path = append(path, c)
 	}
 	forkHeight := n.height - len(path) // height of the last shared block, -1 if none
@@ -256,7 +296,7 @@ func (m *Manager) notify(oldTip *node) {
 	tip := m.tip()
 	reorg := 0
 	if oldTip != nil {
-		for c := oldTip; c != nil && !(c.height < len(m.active) && m.active[c.height] == c); c = c.parent {
+		for c := oldTip; c != nil && !onActive(m.active, c); c = c.parent {
 			reorg++
 		}
 	}
@@ -357,7 +397,7 @@ func (m *Manager) IsActive(hash [32]byte) (int, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	n, ok := m.index[hash]
-	if !ok || n.height >= len(m.active) || m.active[n.height] != n {
+	if !ok || !onActive(m.active, n) {
 		return 0, false
 	}
 	return n.height, true

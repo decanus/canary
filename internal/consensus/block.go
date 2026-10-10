@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/big"
 )
 
 // v0.1 block limits (SPEC.md §4.2).
@@ -17,6 +18,20 @@ const (
 type Block struct {
 	Header *Header
 	Txs    [][]byte
+}
+
+// WellFormed reports whether b can be hashed and serialized: header present and N, K in
+// [0, 2^256). Blocks from DeserializeBlock always are.
+func (b *Block) WellFormed() bool {
+	if b == nil || b.Header == nil {
+		return false
+	}
+	for _, x := range []*big.Int{b.Header.N, b.Header.K} {
+		if x == nil || x.Sign() < 0 || x.BitLen() > 256 {
+			return false
+		}
+	}
+	return true
 }
 
 // Hash returns the block hash (the hash of its header).

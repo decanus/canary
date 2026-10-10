@@ -63,3 +63,30 @@ func TestMineChain(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTimestampRules(t *testing.T) {
+	p := consensus.Prototype
+	p.Epoch = 4
+	hs := func(times ...uint32) consensus.Headers {
+		out := make(consensus.Headers, len(times))
+		for i, tm := range times {
+			out[i] = &consensus.Header{Time: tm}
+		}
+		return out
+	}
+	const T = 1_800_000_000
+	// A peer with a fast clock made block 3; block 4 opens an epoch, so the timewarp rule
+	// requires time >= block3.time - slack even though MTP is far lower.
+	ts, err := timestamp(&p, hs(T, T+1, T+2, T+5000), T+3)
+	if err != nil || int64(ts) != T+5000-p.TimewarpSlack {
+		t.Fatalf("timewarp: got %d, %v", ts, err)
+	}
+	// Mid-epoch only MTP applies.
+	if ts, _ := timestamp(&p, hs(T, T+1, T+5000), T+3); ts != T+3 {
+		t.Fatalf("mid-epoch: got %d", ts)
+	}
+	// A clock far behind the chain fails before any work is done.
+	if _, err := timestamp(&p, hs(T, T+1, T+2), T-p.FutureLimit-10); err == nil {
+		t.Fatal("expected a future-limit error")
+	}
+}

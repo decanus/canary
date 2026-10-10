@@ -248,3 +248,78 @@ func TestRestart(t *testing.T) {
 		t.Fatal("opened a corrupt block file")
 	}
 }
+
+func TestMalformedBlock(t *testing.T) {
+	m, _ := NewMemory(testParams())
+	for _, blk := range []*consensus.Block{
+		nil,
+		{},
+		{Header: &consensus.Header{}},
+		{Header: &consensus.Header{N: new(big.Int).Lsh(big.NewInt(1), 256), K: new(big.Int)}},
+	} {
+		st, err := m.AddBlock(blk, now)
+		if !errors.Is(err, consensus.ErrInvalid) || st == Duplicate {
+			t.Fatalf("got (%v, %v), want ErrInvalid", st, err)
+		}
+	}
+}
+
+func TestDataDirParamsAndReadOnly(t *testing.T) {
+	p := testParams()
+	dir := t.TempDir()
+	g := mine(t, p, nil, "genesis")
+	m, err := Open(dir, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add(t, m, g, NewTip)
+	m.Close()
+
+	other := *p
+	other.Epoch++
+	if _, err := Open(dir, &other); err == nil {
+		t.Fatal("opened a data directory with different params")
+	}
+
+	// A torn tail must be left alone by a read-only open.
+	path := filepath.Join(dir, BlocksFile)
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	f.Write([]byte{9, 0})
+	f.Close()
+	before, _ := os.Stat(path)
+	ro, err := OpenReadOnly(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ro.Params().SameConsensus(p) || tipHash(t, ro) != g.Hash() {
+		t.Fatal("read-only open: wrong params or tip")
+	}
+	if after, _ := os.Stat(path); after.Size() != before.Size() {
+		t.Fatal("read-only open modified blocks.dat")
+	}
+}
+
+func TestZeroFilledTail(t *testing.T) {
+	p := testParams()
+	dir := t.TempDir()
+	g := mine(t, p, nil, "genesis")
+	m, _ := Open(dir, p)
+	add(t, m, g, NewTip)
+	m.Close()
+	path := filepath.Join(dir, BlocksFile)
+	good, _ := os.Stat(path)
+
+	for _, tail := range [][]byte{make([]byte, 50), append([]byte{20, 0, 0, 0}, make([]byte, 20)...)} {
+		f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+		f.Write(tail)
+		f.Close()
+		m, err := Open(dir, p)
+		if err != nil {
+			t.Fatalf("tail %x: %v", tail[:4], err)
+		}
+		m.Close()
+		if st, _ := os.Stat(path); st.Size() != good.Size() {
+			t.Fatalf("zero tail not truncated: %d, want %d", st.Size(), good.Size())
+		}
+	}
+}

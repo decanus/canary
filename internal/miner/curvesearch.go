@@ -47,11 +47,9 @@ func FindCurve(ctx context.Context, p *consensus.Params, prevHash [32]byte, bits
 // A root is a point of order 2, so #E is even and cannot be a large prime.
 func has2Torsion(c *consensus.Curve) bool {
 	f := poly{c.B, c.A, big.NewInt(0), big.NewInt(1)}
-	xp := polyPowXMod(c, c.P)
-	g := xp.sub(poly{big.NewInt(0), big.NewInt(1)}, c.P)
-	if g.degree() < 0 {
-		return true // f divides x^p − x: all three roots are in F_p
-	}
+	g := polyPowXMod(c, c.P) // x^p mod f
+	g[1].Sub(g[1], one).Mod(g[1], c.P)
+	// If g = 0, f divides x^p − x and gcd(f, 0) = f, which also has degree >= 1.
 	return polyGCD(f, g, c.P).degree() >= 1
 }
 
@@ -65,21 +63,6 @@ func (u poly) degree() int {
 		}
 	}
 	return -1
-}
-
-func (u poly) sub(v poly, p *big.Int) poly {
-	out := make(poly, max(len(u), len(v)))
-	for i := range out {
-		out[i] = new(big.Int)
-		if i < len(u) {
-			out[i].Add(out[i], u[i])
-		}
-		if i < len(v) {
-			out[i].Sub(out[i], v[i])
-		}
-		out[i].Mod(out[i], p)
-	}
-	return out
 }
 
 // polyMod returns u mod v over F_p; v must be nonzero.
@@ -168,28 +151,27 @@ func orderInHasse(c *consensus.Curve) *big.Int {
 		}
 		table[string(pt.X.Bytes())] = baby{j, pt.Y}
 	}
-	stride := 2*m + 1
-	step := c.Mul(big.NewInt(stride), c.G)
+	stride := big.NewInt(2*m + 1)
+	step := c.Mul(stride, c.G)
 	base := new(big.Int).Add(lo, big.NewInt(m))
+	end := new(big.Int).Add(hi, big.NewInt(m))
 	S := c.Mul(base, c.G)
-	cand := new(big.Int)
-	for base.Cmp(new(big.Int).Add(hi, big.NewInt(m))) <= 0 {
+	for ; base.Cmp(end) <= 0; base.Add(base, stride) {
+		var cand *big.Int
 		if S == nil {
-			cand.Set(base)
+			cand = new(big.Int).Set(base)
 		} else if b, ok := table[string(S.X.Bytes())]; ok {
+			cand = big.NewInt(b.j)
 			if S.Y.Cmp(b.y) == 0 {
-				cand.Sub(base, big.NewInt(b.j)) // S = jG
+				cand.Sub(base, cand) // S = jG
 			} else {
-				cand.Add(base, big.NewInt(b.j)) // S = −jG
+				cand.Add(base, cand) // S = −jG
 			}
-		} else {
-			cand.SetInt64(-1)
 		}
-		if cand.Sign() > 0 && cand.Cmp(lo) >= 0 && cand.Cmp(hi) <= 0 {
-			return new(big.Int).Set(cand)
+		if cand != nil && cand.Cmp(lo) >= 0 && cand.Cmp(hi) <= 0 {
+			return cand
 		}
 		S = c.Add(S, step)
-		base.Add(base, big.NewInt(stride))
 	}
 	return nil
 }

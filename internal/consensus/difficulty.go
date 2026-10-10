@@ -1,6 +1,9 @@
 package consensus
 
-import "math/big"
+import (
+	"math/big"
+	"slices"
+)
 
 // ChainView is read access to the active chain below the block being validated.
 // Header(i) must return the header at height i for 0 <= i < Len().
@@ -65,11 +68,6 @@ func MedianTimePast(p *Params, chain ChainView) int64 {
 	for i := range times {
 		times[i] = int64(chain.Header(h - w + i).Time)
 	}
-	// Insertion sort: w <= 11.
-	for i := 1; i < len(times); i++ {
-		for j := i; j > 0 && times[j] < times[j-1]; j-- {
-			times[j], times[j-1] = times[j-1], times[j]
-		}
-	}
+	slices.Sort(times)
 	return times[len(times)/2]
 }

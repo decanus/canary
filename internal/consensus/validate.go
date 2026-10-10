@@ -23,7 +23,7 @@ func PuzzlePoint(c *Curve, h *Header) *Point {
 // Unix seconds for live blocks; pass nil when replaying stored or vector chains to skip the
 // future-time rule. The returned error wraps ErrInvalid.
 func ValidateBlock(p *Params, chain ChainView, blk *Block, now *int64) error {
-	if blk == nil || blk.Header == nil || blk.Header.N == nil || blk.Header.K == nil {
+	if !blk.WellFormed() {
 		return invalid("malformed block")
 	}
 	h := blk.Header

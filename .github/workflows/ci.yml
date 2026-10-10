@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    # Explicit bash enables pipefail, so `cmd | tee` fails the step when cmd fails.
+    shell: bash
+
 jobs:
   test:
     name: Go ${{ matrix.go }}

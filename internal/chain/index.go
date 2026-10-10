@@ -15,39 +15,51 @@ type node struct {
 	parent *node    // nil for a genesis block
 }
 
-// view is a consensus.ChainView of the chain ending at tip (inclusive), or of the empty chain if
-// tip is nil. Heights up to the fork point with the active chain are served from active; the
-// side branch above it is collected once.
+// onActive reports whether n is on the active chain.
+func onActive(active []*node, n *node) bool {
+	return n.height < len(active) && active[n.height] == n
+}
+
+// view is a consensus.ChainView of the chain ending at tip (inclusive), or the empty chain if
+// tip is nil. It walks back from tip lazily and switches to the active chain at the first
+// shared ancestor, so validation, which reads at most one epoch back, never walks a whole
+// side branch.
 type view struct {
 	active []*node
-	fork   int     // highest height shared with active (-1 if none)
-	side   []*node // side[i] is at height fork+1+i
+	tip    *node
+	path   []*node // path[i] is at height tip.height - i
+	fork   int     // height of the first active ancestor, valid once done; -1 if none
+	done   bool
 }
 
 func newView(active []*node, tip *node) *view {
-	v := &view{active: active, fork: -1}
-	if tip == nil {
-		return v
-	}
-	n := tip
-	for n != nil && !(n.height < len(active) && active[n.height] == n) {
-		v.side = append(v.side, n)
-		n = n.parent
-	}
-	if n != nil {
-		v.fork = n.height
-	}
-	for i, j := 0, len(v.side)-1; i < j; i, j = i+1, j-1 {
-		v.side[i], v.side[j] = v.side[j], v.side[i]
-	}
-	return v
+	return &view{active: active, tip: tip, fork: -1}
 }
 
-func (v *view) Len() int { return v.fork + 1 + len(v.side) }
+func (v *view) Len() int {
+	if v.tip == nil {
+		return 0
+	}
+	return v.tip.height + 1
+}
 
 func (v *view) Header(i int) *consensus.Header {
+	for !v.done && (len(v.path) == 0 || v.path[len(v.path)-1].height > i) {
+		next := v.tip
+		if len(v.path) > 0 {
+			next = v.path[len(v.path)-1].parent
+		}
+		switch {
+		case next == nil:
+			v.done = true
+		case onActive(v.active, next):
+			v.fork, v.done = next.height, true
+		default:
+			v.path = append(v.path, next)
+		}
+	}
 	if i <= v.fork {
 		return v.active[i].block.Header
 	}
-	return v.side[i-v.fork-1].block.Header
+	return v.path[v.tip.height-i].block.Header
 }

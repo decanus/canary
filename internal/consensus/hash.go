@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math/big"
+	"slices"
 )
 
 // H is SHA-256 over the concatenation of parts.
@@ -39,20 +40,15 @@ func intBE(b []byte) *big.Int {
 
 // le32 encodes x (0 <= x < 2^256) as a 32-byte little-endian integer.
 func le32(x *big.Int) [32]byte {
-	var be [32]byte
-	x.FillBytes(be[:])
 	var out [32]byte
-	for i := range be {
-		out[i] = be[31-i]
-	}
+	x.FillBytes(out[:])
+	slices.Reverse(out[:])
 	return out
 }
 
 // fromLE32 decodes a 32-byte little-endian unsigned integer.
 func fromLE32(b []byte) *big.Int {
-	var be [32]byte
-	for i := 0; i < 32; i++ {
-		be[i] = b[31-i]
-	}
-	return new(big.Int).SetBytes(be[:])
+	be := slices.Clone(b[:32])
+	slices.Reverse(be)
+	return new(big.Int).SetBytes(be)
 }

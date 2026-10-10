@@ -26,8 +26,8 @@ commands:
   verify FILE      validate a chain JSON file and print its cumulative work
   mine --chain FILE [--blocks N] [--threads N] [--miner-address STR] [--profile prototype|mainnet]
                    mine blocks onto a chain JSON file (created if missing), offline
-  export --datadir DIR [--profile prototype|mainnet] FILE
-                   write a node's active chain as chain JSON
+  export --datadir DIR FILE
+                   write a node's active chain as chain JSON (read-only)
   node             not implemented yet (milestones M4–M5)
 `
 
@@ -62,12 +62,12 @@ func main() {
 }
 
 func runVectors(args []string) error {
-	fs := flag.NewFlagSet("vectors", flag.ExitOnError)
-	verbose := fs.Bool("v", false, "print every vector, not just failures")
-	fs.Parse(args)
+	fset := flag.NewFlagSet("vectors", flag.ExitOnError)
+	verbose := fset.Bool("v", false, "print every vector, not just failures")
+	fset.Parse(args)
 	path := "reference/test_vectors.json"
-	if fs.NArg() > 0 {
-		path = fs.Arg(0)
+	if fset.NArg() > 0 {
+		path = fset.Arg(0)
 	}
 	v, err := conformance.Load(path)
 	if err != nil {
@@ -110,7 +110,7 @@ func runVerify(args []string) error {
 func runMine(args []string) error {
 	fset := flag.NewFlagSet("mine", flag.ExitOnError)
 	chainPath := fset.String("chain", "", "chain JSON file (required)")
-	blocks := fset.Int("blocks", 10, "number of blocks to mine")
+	count := fset.Int("blocks", 10, "number of blocks to mine")
 	threads := fset.Int("threads", runtime.NumCPU(), "rho worker goroutines")
 	minerAddr := fset.String("miner-address", "miner-address", "miner identity in the coinbase")
 	profile := fset.String("profile", "prototype", "params for a new chain file: prototype or mainnet")
@@ -122,7 +122,7 @@ func runMine(args []string) error {
 		return errors.New("usage: canary mine --chain FILE.json [--blocks N]")
 	}
 
-	p, chain, err := chainjson.Load(*chainPath)
+	p, blocks, err := chainjson.Load(*chainPath)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		if p, err = profileParams(*profile); err != nil {
@@ -144,30 +144,30 @@ func runMine(args []string) error {
 		return err
 	default:
 		// Refuse to extend a chain that does not validate.
-		if _, err := consensus.ValidateChain(p, chain); err != nil {
+		if _, err := consensus.ValidateChain(p, blocks); err != nil {
 			return fmt.Errorf("existing chain: %w", err)
 		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	headers := make(consensus.Headers, len(chain))
-	for i, b := range chain {
+	headers := make(consensus.Headers, len(blocks))
+	for i, b := range blocks {
 		headers[i] = b.Header
 	}
-	for i := 0; i < *blocks; i++ {
+	for i := 0; i < *count; i++ {
 		res, err := miner.MineBlock(ctx, p, headers, *minerAddr, *threads, time.Now().Unix())
 		if err != nil {
 			return err
 		}
-		chain = append(chain, res.Block)
+		blocks = append(blocks, res.Block)
 		headers = append(headers, res.Block.Header)
-		if err := chainjson.Save(*chainPath, p, chain); err != nil {
+		if err := chainjson.Save(*chainPath, p, blocks); err != nil {
 			return err
 		}
 		h := res.Block.Hash()
 		fmt.Fprintf(os.Stderr, "block %4d  bits=%d  ctr=%-5d curve %6.2fs  rho %7.2fs  dps=%-6d hash=%x\n",
-			len(chain)-1, res.Block.Header.Bits, res.CurveCtr, res.CurveTime.Seconds(),
+			len(blocks)-1, res.Block.Header.Bits, res.CurveCtr, res.CurveTime.Seconds(),
 			res.RhoTime.Seconds(), res.Rho.DistinguishedPoints, h[:8])
 	}
 	return nil
@@ -189,25 +189,16 @@ func profileParams(name string) (*consensus.Params, error) {
 func runExport(args []string) error {
 	fset := flag.NewFlagSet("export", flag.ExitOnError)
 	datadir := fset.String("datadir", "", "node data directory (required)")
-	profile := fset.String("profile", "prototype", "chain params: prototype or mainnet")
 	fset.Parse(args)
 	if *datadir == "" || fset.NArg() != 1 {
 		return errors.New("usage: canary export --datadir DIR FILE.json")
 	}
-	p, err := profileParams(*profile)
+	m, err := chain.OpenReadOnly(*datadir)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(*datadir); err != nil {
-		return err
-	}
-	m, err := chain.Open(*datadir, p)
-	if err != nil {
-		return err
-	}
-	defer m.Close()
 	blocks := m.ActiveBlocks()
-	if err := chainjson.Save(fset.Arg(0), p, blocks); err != nil {
+	if err := chainjson.Save(fset.Arg(0), m.Params(), blocks); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "exported %d blocks\n", len(blocks))
