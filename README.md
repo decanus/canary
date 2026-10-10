@@ -10,7 +10,8 @@ the bit-size `b` of the curve's prime group order `n`. Because the cost of the b
 how large a discrete log the network can solve per block interval. It's a canary for ECDLP
 capacity, and `256 − b` is the distance to secp256k1.
 
-> **Status:** prototype, milestones M1 (consensus library) and M2 (offline mining) of 5 are done. There are no transactions,
+> **Status:** prototype, milestones M1–M3 of 5 are done (consensus library, offline mining,
+> storage and chain manager). Networking (M4) and the HTTP API (M5) are next. There are no transactions,
 > coins or wallets; a block carries opaque byte strings. Not for production use.
 
 ## How it works
@@ -34,6 +35,8 @@ internal/consensus/     consensus rules: hashing, BPSW primality, curves, hash-t
                         header/block encoding, merkle, difficulty, validation, work
 internal/miner/          curve search (2-torsion filter + baby-step giant-step order finding) and
                         parallel Pollard rho with distinguished points
+internal/chain/          append-only block store, block tree with side chains, fork choice by
+                        cumulative work, reorgs, orphan pool, tip-change events
 internal/chainjson/     chain JSON format shared with the Python reference
 internal/conformance/   runner for reference/test_vectors.json
 reference/              Python reference implementation (the consensus oracle) and vectors
@@ -53,6 +56,7 @@ go test ./...                                    # unit, vector and fuzz-seed te
 go run ./cmd/canary vectors                      # conformance run against reference/test_vectors.json
 go run ./cmd/canary verify chain.json            # validate a chain file, print cumulative work
 go run ./cmd/canary mine --chain chain.json --blocks 10   # mine offline (creates the file if missing)
+go run ./cmd/canary export --datadir DIR out.json         # dump a node's active chain as chain JSON
 
 python3 reference/canary.py mine chain.json -n 5 # mine with the reference miner
 python3 reference/canary.py verify chain.json    # cross-check with the reference
@@ -64,6 +68,15 @@ Fuzzing:
 go test ./internal/consensus -fuzz FuzzValidateBlock
 go test ./internal/consensus -fuzz FuzzBlockRoundTrip
 ```
+
+## Storage
+
+A data directory holds `blocks.dat`: append-only records of `u32le(len) ‖ block`, each synced
+before it counts. Every valid block is stored, side-chain blocks included. On startup the node
+replays the file through full validation (except the future-time rule) to rebuild the block
+tree. A torn final record left by a crash is truncated; a complete record that won't decode is
+reported as corruption. The data directory doesn't record its params, so commands that open one
+take `--profile`.
 
 ## Parameters
 
@@ -79,7 +92,7 @@ go test ./internal/consensus -fuzz FuzzBlockRoundTrip
 
 - [x] **M1** Consensus library, passing all reference vectors
 - [x] **M2** Offline mining (curve search + parallel Pollard rho) and JSON interop with the reference
-- [ ] **M3** Block storage, chain manager, reorgs
+- [x] **M3** Block storage, chain manager, reorgs
 - [ ] **M4** TCP peer-to-peer block relay
 - [ ] **M5** Local HTTP API with benchmark stats
 

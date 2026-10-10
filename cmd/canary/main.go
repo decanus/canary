@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/decanus/canary/internal/chain"
 	"github.com/decanus/canary/internal/chainjson"
 	"github.com/decanus/canary/internal/conformance"
 	"github.com/decanus/canary/internal/consensus"
@@ -25,7 +26,9 @@ commands:
   verify FILE      validate a chain JSON file and print its cumulative work
   mine --chain FILE [--blocks N] [--threads N] [--miner-address STR] [--profile prototype|mainnet]
                    mine blocks onto a chain JSON file (created if missing), offline
-  node, export     not implemented yet (milestones M3–M5)
+  export --datadir DIR [--profile prototype|mainnet] FILE
+                   write a node's active chain as chain JSON
+  node             not implemented yet (milestones M4–M5)
 `
 
 func main() {
@@ -41,7 +44,9 @@ func main() {
 		err = runVerify(args)
 	case "mine":
 		err = runMine(args)
-	case "node", "export":
+	case "export":
+		err = runExport(args)
+	case "node":
 		err = fmt.Errorf("%s: not implemented yet", cmd)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
@@ -120,15 +125,8 @@ func runMine(args []string) error {
 	p, chain, err := chainjson.Load(*chainPath)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		switch *profile {
-		case "prototype":
-			p = new(consensus.Params)
-			*p = consensus.Prototype
-		case "mainnet":
-			p = new(consensus.Params)
-			*p = consensus.Mainnet
-		default:
-			return fmt.Errorf("unknown profile %q", *profile)
+		if p, err = profileParams(*profile); err != nil {
+			return err
 		}
 		if *epoch != 0 {
 			p.Epoch = *epoch
@@ -172,5 +170,46 @@ func runMine(args []string) error {
 			len(chain)-1, res.Block.Header.Bits, res.CurveCtr, res.CurveTime.Seconds(),
 			res.RhoTime.Seconds(), res.Rho.DistinguishedPoints, h[:8])
 	}
+	return nil
+}
+
+func profileParams(name string) (*consensus.Params, error) {
+	var p consensus.Params
+	switch name {
+	case "prototype":
+		p = consensus.Prototype
+	case "mainnet":
+		p = consensus.Mainnet
+	default:
+		return nil, fmt.Errorf("unknown profile %q", name)
+	}
+	return &p, nil
+}
+
+func runExport(args []string) error {
+	fset := flag.NewFlagSet("export", flag.ExitOnError)
+	datadir := fset.String("datadir", "", "node data directory (required)")
+	profile := fset.String("profile", "prototype", "chain params: prototype or mainnet")
+	fset.Parse(args)
+	if *datadir == "" || fset.NArg() != 1 {
+		return errors.New("usage: canary export --datadir DIR FILE.json")
+	}
+	p, err := profileParams(*profile)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(*datadir); err != nil {
+		return err
+	}
+	m, err := chain.Open(*datadir, p)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	blocks := m.ActiveBlocks()
+	if err := chainjson.Save(fset.Arg(0), p, blocks); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "exported %d blocks\n", len(blocks))
 	return nil
 }
