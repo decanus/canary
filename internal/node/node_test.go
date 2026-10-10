@@ -36,7 +36,7 @@ func start(t *testing.T, p *consensus.Params, mine bool, peers ...*Node) *Node {
 		Params:       p,
 		P2P:          p2p.Config{Listen: []string{"/ip4/127.0.0.1/tcp/0"}, Peers: addrs, PollEvery: time.Hour},
 		Mine:         mine,
-		MinerAddress: "test-miner",
+		MinerAddress: consensus.Address{0xaa},
 		Threads:      2,
 		MineDelay:    200 * time.Millisecond,
 		Logf:         t.Logf,
@@ -97,18 +97,18 @@ func TestPeerSendingInvalidBlockIsBanned(t *testing.T) {
 	p := testParams()
 	a := start(t, p, false)
 	// Give a a short chain so the attacker can build a block that passes the cheap checks.
-	var headers consensus.Headers
 	for i := 0; i < 3; i++ {
-		res, err := miner.MineBlock(context.Background(), p, headers, "a", 2, time.Now().Unix())
+		headers, st := a.Chain.Snapshot()
+		res, err := miner.MineBlock(context.Background(), p, headers, st, consensus.Address{1}, nil, 2, time.Now().Unix())
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := a.Chain.AddBlock(res.Block, time.Now().Unix()); err != nil {
 			t.Fatal(err)
 		}
-		headers = append(headers, res.Block.Header)
 	}
-	res, err := miner.MineBlock(context.Background(), p, headers, "attacker", 2, time.Now().Unix())
+	headers, st := a.Chain.Snapshot()
+	res, err := miner.MineBlock(context.Background(), p, headers, st, consensus.Address{2}, nil, 2, time.Now().Unix())
 	if err != nil {
 		t.Fatal(err)
 	}

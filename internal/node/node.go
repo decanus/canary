@@ -19,7 +19,7 @@ type Config struct {
 	Params       *consensus.Params
 	P2P          p2p.Config // DataDir, Now and Logf default to the node's
 	Mine         bool
-	MinerAddress string
+	MinerAddress consensus.Address
 	Threads      int
 	MineDelay    time.Duration // pause after each mined block (tests use it to pace mining)
 	Now          func() int64  // default time.Now().Unix
@@ -84,7 +84,7 @@ func (n *Node) mine(ctx context.Context) {
 		case <-events:
 		default:
 		}
-		headers := n.Chain.ActiveHeaders()
+		headers, state := n.Chain.Snapshot()
 		solveCtx, cancel := context.WithCancel(ctx)
 		done, watcherExited := make(chan struct{}), make(chan struct{})
 		go func() {
@@ -95,7 +95,7 @@ func (n *Node) mine(ctx context.Context) {
 			case <-done:
 			}
 		}()
-		res, err := miner.MineBlock(solveCtx, n.cfg.Params, headers, n.cfg.MinerAddress, n.cfg.Threads, n.cfg.Now())
+		res, err := miner.MineBlock(solveCtx, n.cfg.Params, headers, state, n.cfg.MinerAddress, nil, n.cfg.Threads, n.cfg.Now())
 		close(done)
 		// Wait for the watcher so it cannot take a tip event meant for the next iteration.
 		<-watcherExited

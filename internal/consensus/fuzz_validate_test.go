@@ -24,6 +24,13 @@ func FuzzValidateBlock(f *testing.F) {
 		base = append(base, b.Header)
 	}
 	last := blocks[len(blocks)-1]
+	heights := []int{0, len(base) / 2, len(base)}
+	states := make([]consensus.State, len(heights))
+	for i, h := range heights {
+		if _, states[i], err = consensus.ValidateChain(&v.Params, blocks[:h]); err != nil {
+			f.Fatal(err)
+		}
+	}
 	f.Add(last.Serialize(), int64(0))
 	f.Add([]byte{}, int64(-1))
 	f.Add(make([]byte, consensus.HeaderSize+1), int64(5))
@@ -34,12 +41,12 @@ func FuzzValidateBlock(f *testing.F) {
 		if len(b) >= consensus.HeaderSize {
 			h, _ := consensus.DeserializeHeader(b[:consensus.HeaderSize])
 			blk := &consensus.Block{Header: h, Txs: [][]byte{b[consensus.HeaderSize:]}}
-			for _, height := range []int{0, len(base) / 2, len(base)} {
-				_ = consensus.ValidateBlock(&params, base[:height], blk, &now)
+			for i, height := range heights {
+				consensus.ValidateBlock(&params, base[:height], states[i], blk, &now)
 			}
 		}
 		if blk, err := consensus.DeserializeBlock(b); err == nil {
-			_ = consensus.ValidateBlock(&params, base, blk, nil)
+			consensus.ValidateBlock(&params, base, states[len(states)-1], blk, nil)
 		}
 	})
 }

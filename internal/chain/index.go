@@ -13,6 +13,60 @@ type node struct {
 	height int
 	work   *big.Int // cumulative work from genesis through this block
 	parent *node    // nil for a genesis block
+	diff   []change // accounts this block changed
+}
+
+// change records one account before and after a block, so state can be moved along the tree.
+type change struct {
+	addr          consensus.Address
+	before, after consensus.Account
+}
+
+// stateAt returns the account state after n (empty for nil), given the active chain and the
+// state after its tip. It undoes active blocks above the fork point and redoes n's branch.
+// The result may be tipState itself; callers must not modify it.
+func stateAt(active []*node, tipState consensus.State, n *node) consensus.State {
+	if n == nil {
+		return consensus.State{}
+	}
+	if len(active) > 0 && active[len(active)-1] == n {
+		return tipState
+	}
+	var branch []*node
+	c := n
+	for c != nil && !onActive(active, c) {
+		branch = append(branch, c)
+		c = c.parent
+	}
+	fork := -1
+	if c != nil {
+		fork = c.height
+	}
+	st := tipState.Clone()
+	for h := len(active) - 1; h > fork; h-- {
+		for _, ch := range active[h].diff {
+			st.Set(ch.addr, ch.before)
+		}
+	}
+	for i := len(branch) - 1; i >= 0; i-- {
+		for _, ch := range branch[i].diff {
+			st.Set(ch.addr, ch.after)
+		}
+	}
+	return st
+}
+
+// diffOf records the touched accounts' values in before and after.
+func diffOf(before, after consensus.State, touched []consensus.Address) []change {
+	seen := make(map[consensus.Address]bool, len(touched))
+	var out []change
+	for _, a := range touched {
+		if !seen[a] {
+			seen[a] = true
+			out = append(out, change{addr: a, before: before.Get(a), after: after.Get(a)})
+		}
+	}
+	return out
 }
 
 // onActive reports whether n is on the active chain.

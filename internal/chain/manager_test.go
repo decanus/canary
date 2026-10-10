@@ -21,14 +21,21 @@ func testParams() *consensus.Params {
 
 const now = int64(1_800_000_000)
 
-// mine mines one block on top of the given chain (oldest first).
-func mine(t *testing.T, p *consensus.Params, chain []*consensus.Block, addr string) *consensus.Block {
+// addr is a test account address derived from a name.
+func addr(name string) consensus.Address { return consensus.H([]byte(name)) }
+
+// mine mines one block on top of the given chain (oldest first), paying addr(name).
+func mine(t *testing.T, p *consensus.Params, chain []*consensus.Block, name string) *consensus.Block {
 	t.Helper()
 	hs := make(consensus.Headers, len(chain))
 	for i, b := range chain {
 		hs[i] = b.Header
 	}
-	res, err := miner.MineBlock(context.Background(), p, hs, addr, 2, now+int64(len(chain)))
+	_, st, err := consensus.ValidateChain(p, chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := miner.MineBlock(context.Background(), p, hs, st, addr(name), nil, 2, now+int64(len(chain)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +133,13 @@ func TestReorg(t *testing.T) {
 	}
 	if _, _, w, _ := m.Tip(); w.Cmp(work(g, b[0], b[1], b[2])) != 0 {
 		t.Errorf("tip work %s", w)
+	}
+	// Account state followed the reorg: alice's rewards were undone, bob's applied.
+	if got := m.Account(addr("alice")).Balance; got.Sign() != 0 {
+		t.Errorf("alice balance %s after reorg, want 0", got)
+	}
+	if got, want := m.Account(addr("bob")).Balance, work(b...); got.Cmp(want) != 0 {
+		t.Errorf("bob balance %s, want %s", got, want)
 	}
 }
 

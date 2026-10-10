@@ -10,9 +10,9 @@ the bit-size `b` of the curve's prime group order `n`. Because the cost of the b
 how large a discrete log the network can solve per block interval. It's a canary for ECDLP
 capacity, and `256 − b` is the distance to secp256k1.
 
-> **Status:** prototype, milestones M1–M4 of 5 are done (consensus library, offline mining,
-> storage and chain manager, libp2p networking). The HTTP API (M5) is next. There are no transactions,
-> coins or wallets; a block carries opaque byte strings. Not for production use.
+> **Status:** prototype. Done: consensus, offline mining, storage and reorgs, libp2p networking,
+> and v0.2 accounts (post-quantum signed transfers, state root, issuance proportional to work).
+> Next: wallet, mempool and transaction relay; then the HTTP API. Not for production use.
 
 ## How it works
 
@@ -23,9 +23,11 @@ capacity, and `256 − b` is the distance to secp256k1.
 | Puzzle | `P = HashToCurve(H2(header without k))`. The solution `k` goes in the header. Because `P` commits to the merkle root, and so to the coinbase, a broadcast `k` can't be stolen by another miner. | §5.3 |
 | Difficulty | Every `Epoch` blocks, `b` moves by `round(log₂((expected/actual)²))`, clamped to ±4, since rho work ∝ √n. | §5.4 |
 | Fork choice | `work(block) = isqrt(n)`; the valid chain with the most cumulative work wins. | §5.6 |
+| Coins | Accounts hold a balance and a nonce. Transfers are signed with SLH-DSA (post-quantum, hash-based) and the header commits to a sparse-Merkle state root. | §4.4, §5.7 |
+| Issuance | The block reward is the block's work, `isqrt(n)`, so **total supply equals cumulative chain work**: one unit of currency is one unit of discrete-log work. | §5.8 |
 
-The block header is a fixed 144 bytes: version, prev hash, merkle root, time, bits, curve
-counter, `n` and `k`. Blocks are linked by `H2(header)`, which carries no work itself.
+The block header is a fixed 176 bytes: version, prev hash, merkle root, state root, time, bits,
+curve counter, `n` and `k`. Blocks are linked by `H2(header)`, which carries no work itself.
 
 ## Repository layout
 
@@ -39,6 +41,7 @@ internal/chain/          append-only block store, block tree with side chains, f
                         cumulative work, reorgs, orphan pool, tip-change events
 internal/p2p/            libp2p networking: status and sync protocols, GossipSub block relay, bans
 internal/node/           full node: chain + p2p + mining loop
+internal/wallet/         SLH-DSA keys, transfer signing, key files
 internal/chainjson/     chain JSON format shared with the Python reference
 internal/conformance/   runner for reference/test_vectors.json
 reference/              Python reference implementation (the consensus oracle) and vectors
@@ -57,7 +60,8 @@ Requires Go 1.25.7+. The Python reference needs Python 3.8+ and no dependencies.
 go test ./...                                    # unit, vector and fuzz-seed tests
 go run ./cmd/canary vectors                      # conformance run against reference/test_vectors.json
 go run ./cmd/canary verify chain.json            # validate a chain file, print cumulative work
-go run ./cmd/canary mine --chain chain.json --blocks 10   # mine offline (creates the file if missing)
+go run ./cmd/canary keygen --out alice.key                # new SLH-DSA key; prints its address
+go run ./cmd/canary mine --chain chain.json --miner-address ADDR --blocks 10   # mine offline
 go run ./cmd/canary export --datadir DIR out.json         # dump a node's active chain as chain JSON
 
 python3 reference/canary.py mine chain.json -n 5 # mine with the reference miner
@@ -67,7 +71,7 @@ python3 reference/canary.py verify chain.json    # cross-check with the referenc
 Running a network:
 
 ```sh
-canary node --mine                               # prints its /ip4/.../p2p/<id> addresses
+canary node --mine --miner-address ADDR          # prints its /ip4/.../p2p/<id> addresses
 canary node --peers /ip4/1.2.3.4/tcp/18555/p2p/12D3Koo...
 ```
 
@@ -107,7 +111,9 @@ take `--profile`.
 - [x] **M2** Offline mining (curve search + parallel Pollard rho) and JSON interop with the reference
 - [x] **M3** Block storage, chain manager, reorgs
 - [x] **M4** Peer-to-peer block relay over libp2p
-- [ ] **M5** Local HTTP API with benchmark stats
+- [x] **A1** Accounts: SLH-DSA signed transfers, state root, issuance proportional to work
+- [ ] **A2** Wallet CLI, mempool and transaction relay
+- [ ] **M5** Local HTTP API with benchmark stats and balances
 
 ## Mining performance
 
@@ -118,11 +124,12 @@ been needed yet.
 
 ## Cryptography and quantum resistance
 
-Consensus relies only on SHA-256, which keeps about 128-bit security against quantum attackers.
-Peer identities (Ed25519) and transport encryption are classical. That's deliberate: they protect
-nothing consensus-critical, because every block is validated regardless of who sent it. When
-transactions are added, they'll use post-quantum signatures from day one. A chain that measures
-progress toward breaking elliptic curves shouldn't secure its own coins with them. See SPEC §9.1.
+Consensus relies only on SHA-256: block hashing, the state root, and SLH-DSA-SHA2-128s (FIPS 205)
+signatures on transfers, which keep about 128-bit security against quantum attackers. A chain that
+measures progress toward breaking elliptic curves shouldn't secure its own coins with them. Peer
+identities (Ed25519) and transport encryption are classical. That's deliberate: they protect
+nothing consensus-critical, because every block is validated regardless of who sent it. Signing
+takes about 3 s and verifying about 2.5 ms in Go, and signatures are 7.9 KB. See SPEC §9.1.
 
 ## Known limitations
 

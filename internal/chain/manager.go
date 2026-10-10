@@ -59,7 +59,8 @@ type Manager struct {
 
 	mu      sync.RWMutex
 	index   map[[32]byte]*node
-	active  []*node // active[h] is the active block at height h
+	active  []*node         // active[h] is the active block at height h
+	state   consensus.State // account state after the tip; replaced, never modified
 	orphans map[[32]byte]*consensus.Block
 	order   [][32]byte              // orphan arrival order, for eviction
 	waiting map[[32]byte][][32]byte // parent hash -> orphan hashes
@@ -130,6 +131,7 @@ func newManager(p *consensus.Params) *Manager {
 		params:  p,
 		index:   make(map[[32]byte]*node),
 		orphans: make(map[[32]byte]*consensus.Block),
+		state:   consensus.State{},
 		waiting: make(map[[32]byte][][32]byte),
 	}
 }
@@ -212,7 +214,9 @@ func (m *Manager) add(blk *consensus.Block, now *int64, persist bool) (Status, e
 
 // connect validates blk on top of parent, stores it and switches the tip if it has more work.
 func (m *Manager) connect(hash [32]byte, blk *consensus.Block, parent *node, now *int64, persist bool) (Status, error) {
-	if err := consensus.ValidateBlock(m.params, newView(m.active, parent), blk, now); err != nil {
+	before := stateAt(m.active, m.state, parent)
+	after, touched, err := consensus.ValidateBlock(m.params, newView(m.active, parent), before, blk, now)
+	if err != nil {
 		return 0, err
 	}
 	if persist && m.store != nil {
@@ -220,7 +224,7 @@ func (m *Manager) connect(hash [32]byte, blk *consensus.Block, parent *node, now
 			return 0, fmt.Errorf("storing block: %w", err)
 		}
 	}
-	n := &node{hash: hash, block: blk, parent: parent, work: consensus.Work(blk.Header)}
+	n := &node{hash: hash, block: blk, parent: parent, work: consensus.Work(blk.Header), diff: diffOf(before, after, touched)}
 	if parent != nil {
 		n.height = parent.height + 1
 		n.work.Add(n.work, parent.work)
@@ -228,6 +232,7 @@ func (m *Manager) connect(hash [32]byte, blk *consensus.Block, parent *node, now
 	m.index[hash] = n
 	if tip := m.tip(); tip == nil || n.work.Cmp(tip.work) > 0 {
 		m.setTip(n)
+		m.state = after
 		return NewTip, nil
 	}
 	return SideChain, nil
@@ -436,4 +441,33 @@ func (m *Manager) Locator() [][32]byte {
 		out = append(out, m.active[0].hash)
 	}
 	return out
+}
+
+// Snapshot returns the active chain's headers and the account state after its tip, consistently.
+// The state is shared and must not be modified.
+func (m *Manager) Snapshot() (consensus.Headers, consensus.State) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	hs := make(consensus.Headers, len(m.active))
+	for i, n := range m.active {
+		hs[i] = n.block.Header
+	}
+	return hs, m.state
+}
+
+// Account returns the account at addr on the active chain.
+func (m *Manager) Account(addr consensus.Address) consensus.Account {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.state.Get(addr)
+}
+
+// GenesisHash returns the active chain's genesis block hash; ok is false for an empty chain.
+func (m *Manager) GenesisHash() (hash [32]byte, ok bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.active) == 0 {
+		return hash, false
+	}
+	return m.active[0].hash, true
 }

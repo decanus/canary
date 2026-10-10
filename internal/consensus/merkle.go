@@ -22,14 +22,3 @@ func MerkleRoot(txs [][]byte) [32]byte {
 	}
 	return layer[0]
 }
-
-// Coinbase builds the conventional coinbase "coinbase|" ‖ u32le(height) ‖ "|" ‖ miner ‖ "|" ‖ extra.
-// Not enforced by consensus in v0.1.
-func Coinbase(height uint32, miner string, extra []byte) []byte {
-	b := []byte("coinbase|")
-	b = append(b, u32le(height)...)
-	b = append(b, '|')
-	b = append(b, miner...)
-	b = append(b, '|')
-	return append(b, extra...)
-}

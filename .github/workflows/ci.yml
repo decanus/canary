@@ -35,10 +35,13 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: go vet
         run: go vet ./...
-      - name: Consensus imports only the standard library
+      - name: Consensus imports only the standard library (plus CIRCL SLH-DSA)
         run: |
-          deps=$(go list -deps -f '{{if not .Standard}}{{.ImportPath}}{{end}}' ./internal/consensus | grep -v '^github.com/decanus/canary/internal/consensus$' || true)
-          test -z "$deps" || { echo "non-stdlib imports in internal/consensus:"; echo "$deps"; exit 1; }
+          deps=$(go list -deps -f '{{if not .Standard}}{{.ImportPath}}{{end}}' ./internal/consensus \
+            | grep -vE '^(github.com/decanus/canary/internal/consensus|github.com/cloudflare/circl/.*|golang.org/x/(crypto|sys)/.*)$' || true)
+          test -z "$deps" || { echo "unexpected imports in internal/consensus:"; echo "$deps"; exit 1; }
+          # CIRCL may only be used from consensus/slhdsa.go.
+          test "$(grep -l cloudflare/circl internal/consensus/*.go)" = "internal/consensus/slhdsa.go"
       - name: go test
         run: go test -race -timeout 10m ./...
       - name: Conformance vectors
@@ -75,8 +78,11 @@ jobs:
           python3 reference/canary.py verify chain.json | tee py.txt
           go run ./cmd/canary verify chain.json | tee go.txt
           diff py.txt go.txt
+      - name: Python SLH-DSA against NIST ACVP vectors
+        run: python3 reference/test_slhdsa.py
       - name: Mine with Go, verify with Python
         run: |
-          go run ./cmd/canary mine --chain mined.json --blocks 5 --genesis-bits 32 --epoch 4
+          go run ./cmd/canary mine --chain mined.json --blocks 5 --genesis-bits 32 --epoch 4 \
+            --miner-address 00000000000000000000000000000000000000000000000000000000000000aa
           python3 reference/canary.py verify mined.json
           go run ./cmd/canary verify mined.json

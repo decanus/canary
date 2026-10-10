@@ -31,7 +31,11 @@ func extend(t *testing.T, p *consensus.Params, base []*consensus.Block, n int, a
 		for j, b := range out {
 			hs[j] = b.Header
 		}
-		res, err := miner.MineBlock(context.Background(), p, hs, addr, 2, t0+int64(len(out)))
+		_, st, err := consensus.ValidateChain(p, out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := miner.MineBlock(context.Background(), p, hs, st, consensus.H([]byte(addr)), nil, 2, t0+int64(len(out)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -102,7 +106,7 @@ func TestSyncLongSideBranch(t *testing.T) {
 func TestTooNewBlockDoesNotBan(t *testing.T) {
 	p := testParams()
 	n := newNode(t, p, nil)
-	res, err := miner.MineBlock(context.Background(), p, consensus.Headers{}, "x", 2, t0+1e6+p.FutureLimit+100)
+	res, err := miner.MineBlock(context.Background(), p, consensus.Headers{}, consensus.State{}, consensus.Address{}, nil, 2, t0+1e6+p.FutureLimit+100)
 	if err != nil {
 		t.Fatal(err)
 	}

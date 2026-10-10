@@ -22,12 +22,15 @@ import (
 	"github.com/decanus/canary/internal/miner"
 	"github.com/decanus/canary/internal/node"
 	"github.com/decanus/canary/internal/p2p"
+	"github.com/decanus/canary/internal/wallet"
 )
 
 const usage = `usage: canary <command> [args]
 
 commands:
   vectors [FILE]   run the conformance vectors (default reference/test_vectors.json)
+  keygen --out FILE
+                   create an SLH-DSA key, print its address
   verify FILE      validate a chain JSON file and print its cumulative work
   mine --chain FILE [--blocks N] [--threads N] [--miner-address STR] [--profile prototype|mainnet]
                    mine blocks onto a chain JSON file (created if missing), offline
@@ -51,6 +54,8 @@ func main() {
 		err = runVerify(args)
 	case "mine":
 		err = runMine(args)
+	case "keygen":
+		err = runKeygen(args)
 	case "export":
 		err = runExport(args)
 	case "node":
@@ -106,11 +111,11 @@ func runVerify(args []string) error {
 	if err != nil {
 		return err
 	}
-	work, err := consensus.ValidateChain(p, blocks)
+	work, state, err := consensus.ValidateChain(p, blocks)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("valid chain, cumulative work %s\n", work)
+	fmt.Printf("valid chain, cumulative work %s, %d accounts, supply %s\n", work, len(state), state.Supply())
 	return nil
 }
 
@@ -119,17 +124,22 @@ func runMine(args []string) error {
 	chainPath := fset.String("chain", "", "chain JSON file (required)")
 	count := fset.Int("blocks", 10, "number of blocks to mine")
 	threads := fset.Int("threads", runtime.NumCPU(), "rho worker goroutines")
-	minerAddr := fset.String("miner-address", "miner-address", "miner identity in the coinbase")
+	minerHex := fset.String("miner-address", "", "address (hex) that receives rewards (required)")
 	profile := fset.String("profile", "prototype", "params for a new chain file: prototype or mainnet")
 	epoch := fset.Int64("epoch", 0, "override epoch for a new chain file")
 	tau := fset.Int64("tau", 0, "override tau for a new chain file")
 	genesisBits := fset.Uint("genesis-bits", 0, "override genesis bits for a new chain file")
 	fset.Parse(args)
-	if *chainPath == "" {
-		return errors.New("usage: canary mine --chain FILE.json [--blocks N]")
+	if *chainPath == "" || *minerHex == "" {
+		return errors.New("usage: canary mine --chain FILE.json --miner-address ADDR [--blocks N]")
+	}
+	minerAddr, err := wallet.ParseAddress(*minerHex)
+	if err != nil {
+		return err
 	}
 
 	p, blocks, err := chainjson.Load(*chainPath)
+	var state consensus.State
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		if p, err = profileParams(*profile); err != nil {
@@ -147,11 +157,12 @@ func runMine(args []string) error {
 		if err := p.Validate(); err != nil {
 			return err
 		}
+		state = consensus.State{}
 	case err != nil:
 		return err
 	default:
 		// Refuse to extend a chain that does not validate.
-		if _, err := consensus.ValidateChain(p, blocks); err != nil {
+		if _, state, err = consensus.ValidateChain(p, blocks); err != nil {
 			return fmt.Errorf("existing chain: %w", err)
 		}
 	}
@@ -163,8 +174,11 @@ func runMine(args []string) error {
 		headers[i] = b.Header
 	}
 	for i := 0; i < *count; i++ {
-		res, err := miner.MineBlock(ctx, p, headers, *minerAddr, *threads, time.Now().Unix())
+		res, err := miner.MineBlock(ctx, p, headers, state, minerAddr, nil, *threads, time.Now().Unix())
 		if err != nil {
+			return err
+		}
+		if state, _, err = consensus.ValidateBlock(p, headers, state, res.Block, nil); err != nil {
 			return err
 		}
 		blocks = append(blocks, res.Block)
@@ -219,10 +233,17 @@ func runNode(args []string) error {
 	listen := fset.String("listen", "", "comma-separated listen multiaddrs (default TCP and QUIC on the profile's port)")
 	peers := fset.String("peers", "", "comma-separated peer multiaddrs ending in /p2p/<id>")
 	mine := fset.Bool("mine", false, "mine blocks")
-	minerAddr := fset.String("miner-address", "miner-address", "miner identity in the coinbase")
+	minerHex := fset.String("miner-address", "", "address (hex) that receives rewards (required with --mine)")
 	threads := fset.Int("threads", runtime.NumCPU(), "rho worker goroutines")
 	fset.Parse(args)
 
+	var minerAddr consensus.Address
+	if *mine {
+		var err error
+		if minerAddr, err = wallet.ParseAddress(*minerHex); err != nil {
+			return fmt.Errorf("--miner-address: %w (create one with canary keygen)", err)
+		}
+	}
 	p, err := profileParams(*profile)
 	if err != nil {
 		return err
@@ -247,7 +268,7 @@ func runNode(args []string) error {
 		Params:       p,
 		P2P:          p2p.Config{Listen: listenAddrs, Peers: splitList(*peers)},
 		Mine:         *mine,
-		MinerAddress: *minerAddr,
+		MinerAddress: minerAddr,
 		Threads:      *threads,
 	})
 	if err != nil {
@@ -272,4 +293,23 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+func runKeygen(args []string) error {
+	fset := flag.NewFlagSet("keygen", flag.ExitOnError)
+	out := fset.String("out", "", "file to write the private key to (required; must not exist)")
+	fset.Parse(args)
+	if *out == "" {
+		return errors.New("usage: canary keygen --out FILE")
+	}
+	k, err := wallet.Generate()
+	if err != nil {
+		return err
+	}
+	if err := k.Save(*out); err != nil {
+		return err
+	}
+	a := k.Address()
+	fmt.Printf("%x\n", a)
+	return nil
 }

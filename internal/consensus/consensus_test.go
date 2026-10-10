@@ -79,7 +79,8 @@ func TestCurveArithmetic(t *testing.T) {
 }
 
 func TestBlockRoundTrip(t *testing.T) {
-	txs := [][]byte{Coinbase(7, "miner", nil), make([]byte, 300), {}}
+	cb := &Coinbase{Height: 7, Amount: big.NewInt(9), Extra: []byte("x")}
+	txs := [][]byte{cb.Serialize(), make([]byte, 300), {}}
 	h := &Header{Version: 1, Time: 5, Bits: 36, CurveCtr: 9, N: big.NewInt(12345), K: new(big.Int).Lsh(bigOne, 255)}
 	h.PrevHash[0] = 1
 	h.MerkleRoot = MerkleRoot(txs)

@@ -18,10 +18,11 @@ type Result struct {
 	Rho       RhoStats
 }
 
-// MineBlock mines the next block on chain: it finds a curve, builds the coinbase and header, solves
-// the puzzle and re-validates the result with consensus.ValidateBlock. now is the local clock; the
-// timestamp is raised to the earliest time the timestamp rules allow if now is too early.
-func MineBlock(ctx context.Context, p *consensus.Params, chain consensus.ChainView, minerAddress string, threads int, now int64) (*Result, error) {
+// MineBlock mines the next block on chain, whose account state is parent. It finds a curve,
+// pays the reward plus fees to minerAddr, includes transfers (which must be valid in order on
+// parent), solves the puzzle and re-validates the result with consensus.ValidateBlock. now is
+// the local clock; the timestamp is raised to the earliest time the rules allow if needed.
+func MineBlock(ctx context.Context, p *consensus.Params, chain consensus.ChainView, parent consensus.State, minerAddr consensus.Address, transfers []*consensus.Transfer, threads int, now int64) (*Result, error) {
 	height := chain.Len()
 	var prevHash [32]byte
 	if height > 0 {
@@ -40,24 +41,43 @@ func MineBlock(ctx context.Context, p *consensus.Params, chain consensus.ChainVi
 	if err != nil {
 		return nil, err
 	}
-	txs := [][]byte{consensus.Coinbase(uint32(height), minerAddress, nil)}
 	h := &consensus.Header{
-		Version:    1,
-		PrevHash:   prevHash,
-		MerkleRoot: consensus.MerkleRoot(txs),
-		Time:       ts,
-		Bits:       bits,
-		CurveCtr:   ctr,
-		N:          n,
-		K:          new(big.Int),
+		Version:  consensus.Version,
+		PrevHash: prevHash,
+		Time:     ts,
+		Bits:     bits,
+		CurveCtr: ctr,
+		N:        n,
+		K:        new(big.Int),
 	}
+	reward := consensus.Reward(h)
+	fees := new(big.Int)
+	for _, t := range transfers {
+		fees.Add(fees, t.Fee)
+	}
+	cb := &consensus.Coinbase{Height: uint32(height), To: minerAddr, Amount: new(big.Int).Add(reward, fees)}
+	txs := [][]byte{cb.Serialize()}
+	for _, t := range transfers {
+		txs = append(txs, t.Serialize())
+	}
+	genesisHash := [32]byte{}
+	if height > 0 {
+		genesisHash = chain.Header(0).Hash()
+	}
+	st, _, err := consensus.ApplyBlock(parent, cb, transfers, reward, genesisHash)
+	if err != nil {
+		return nil, fmt.Errorf("building block: %w", err)
+	}
+	h.MerkleRoot = consensus.MerkleRoot(txs)
+	h.StateRoot = consensus.StateRoot(st)
+
 	k, stats, err := SolveDLP(ctx, c, consensus.PuzzlePoint(c, h), n, threads)
 	if err != nil {
 		return nil, err
 	}
 	h.K = k
 	blk := &consensus.Block{Header: h, Txs: txs}
-	if err := consensus.ValidateBlock(p, chain, blk, &now); err != nil {
+	if _, _, err := consensus.ValidateBlock(p, chain, parent, blk, &now); err != nil {
 		return nil, fmt.Errorf("mined block failed validation: %w", err)
 	}
 	return &Result{Block: blk, CurveCtr: ctr, CurveTime: t1.Sub(t0), RhoTime: time.Since(t1), Rho: stats}, nil

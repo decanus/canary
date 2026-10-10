@@ -19,6 +19,7 @@ type BlockJSON struct {
 	Version    uint32   `json:"version"`
 	PrevHash   string   `json:"prev_hash"`
 	MerkleRoot string   `json:"merkle_root"`
+	StateRoot  string   `json:"state_root"`
 	Time       uint32   `json:"time"`
 	Bits       uint32   `json:"bits"`
 	CurveCtr   uint32   `json:"curve_ctr"`
@@ -77,6 +78,7 @@ func FromBlock(blk *consensus.Block) BlockJSON {
 		Version:    h.Version,
 		PrevHash:   hex.EncodeToString(h.PrevHash[:]),
 		MerkleRoot: hex.EncodeToString(h.MerkleRoot[:]),
+		StateRoot:  hex.EncodeToString(h.StateRoot[:]),
 		Time:       h.Time,
 		Bits:       h.Bits,
 		CurveCtr:   h.CurveCtr,

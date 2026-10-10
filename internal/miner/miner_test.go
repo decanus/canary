@@ -46,21 +46,29 @@ func TestMineChain(t *testing.T) {
 	p.GenesisBits, p.MinBits, p.Epoch = 32, 28, 4
 	var chain consensus.Headers
 	var blocks []*consensus.Block
+	st := consensus.State{}
+	miner := consensus.Address{1}
 	now := int64(1_800_000_000)
 	for i := 0; i < 6; i++ {
-		res, err := MineBlock(context.Background(), &p, chain, "test-miner", 4, now+int64(i))
+		res, err := MineBlock(context.Background(), &p, chain, st, miner, nil, 4, now+int64(i))
 		if err != nil {
 			t.Fatalf("block %d: %v", i, err)
 		}
 		chain = append(chain, res.Block.Header)
 		blocks = append(blocks, res.Block)
+		st, _, _ = consensus.ValidateBlock(&p, chain[:i], st, res.Block, nil)
 	}
 	// Blocks 1s apart against tau=10 retarget upward at height 4.
 	if chain[4].Bits <= chain[3].Bits {
 		t.Errorf("no retarget: bits %d -> %d", chain[3].Bits, chain[4].Bits)
 	}
-	if _, err := consensus.ValidateChain(&p, blocks); err != nil {
+	work, final, err := consensus.ValidateChain(&p, blocks)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// Supply equals cumulative work, all paid to the miner.
+	if final.Supply().Cmp(work) != 0 || final.Get(miner).Balance.Cmp(work) != 0 {
+		t.Fatalf("supply %s, miner %s, work %s", final.Supply(), final.Get(miner).Balance, work)
 	}
 }
 
