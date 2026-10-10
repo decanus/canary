@@ -1,4 +1,4 @@
-# Canary — Go Build Spec (v0.1, prototype)
+# Canary — Go Build Spec (v0.2, prototype)
 
 > Originally drafted as "ECPoW"; renamed to Canary (including the consensus hash tags, which
 > required regenerating `reference/test_vectors.json`). This document is the single source of truth
@@ -15,24 +15,29 @@ capacity: the current `b` is "how large a discrete log the network solves per bl
 Deliverable: one Go module producing one binary, `canary`, with subcommands for running a node,
 mining, verifying chains and running conformance tests.
 
-### In scope (v0.1)
+### In scope (v0.2)
 - Consensus library (header format, curve derivation, puzzle, difficulty, validation).
+- **Accounts and coins (v0.2):** account-model state (balance, nonce) committed by a state root in
+  every header, transfers signed with post-quantum SLH-DSA, issuance proportional to work (§4.4,
+  §5.7–§5.8).
 - Chain storage, fork choice by cumulative work, reorgs.
 - Parallel Pollard-rho miner.
 - Peer-to-peer block relay over libp2p (§9).
 - Local HTTP JSON API with benchmark stats.
 - Conformance against `reference/test_vectors.json`.
 
-### Out of scope (v0.1)
-- Transactions, UTXO set, scripts, signatures, wallets, mempool. In v0.1 a block carries a list of
-  **opaque byte strings** (`txs`); only the first is conventionally a coinbase. No coin accounting.
+### Out of scope (v0.2)
+- Scripts, smart contracts, multisig, coinbase maturity.
+- Wallet, mempool and transaction relay are the next steps after the v0.2 consensus changes.
 - Bitcoin wire/Core compatibility.
 - Mainnet launch. Mainnet params are defined but the prototype profile is the default.
 
 ## 1. Ground rules for the implementer
 
 1. **Go 1.25.7+ (required by go-libp2p), standard library only** for everything consensus (`crypto/sha256`, `math/big`,
-   `encoding/binary`). Third-party deps are allowed only outside `internal/consensus`, and only if
+   `encoding/binary`), with one exception: SLH-DSA verification uses
+   `github.com/cloudflare/circl/sign/slhdsa` (the Go standard library has no SLH-DSA). The Python
+   reference implements SLH-DSA itself and is checked against the NIST ACVP vectors. Third-party deps are allowed only outside `internal/consensus`, and only if
    clearly justified.
 2. **Consensus code is deterministic integer arithmetic.** No floats, no randomness, no map-iteration
    order dependence, no `big.Int.ProbablyPrime` (see §3.3).
@@ -107,33 +112,51 @@ for i = 0, 1, 2, ...:
 
 ## 4. Block format
 
-### 4.1 Header (144 bytes, fixed)
+### 4.1 Header (176 bytes, fixed)
 | Offset | Field | Size | Encoding |
 |---|---|---|---|
-| 0 | `version` | 4 | u32le, = 1 |
+| 0 | `version` | 4 | u32le, = 2 |
 | 4 | `prev_hash` | 32 | raw bytes: `H2(previous header)`; all-zero for genesis |
 | 36 | `merkle_root` | 32 | raw bytes (§4.3) |
-| 68 | `time` | 4 | u32le Unix seconds |
-| 72 | `bits` | 4 | u32le, the bit-size `b` |
-| 76 | `curve_ctr` | 4 | u32le |
-| 80 | `n` | 32 | le32, claimed prime group order |
-| 112 | `k` | 32 | le32, solution |
+| 68 | `state_root` | 32 | raw bytes: root of the account state *after* this block (§5.7) |
+| 100 | `time` | 4 | u32le Unix seconds |
+| 104 | `bits` | 4 | u32le, the bit-size `b` |
+| 108 | `curve_ctr` | 4 | u32le |
+| 112 | `n` | 32 | le32, claimed prime group order |
+| 144 | `k` | 32 | le32, solution |
 
-- `preHeader` = bytes `[0, 112)` (everything except `k`).
-- `blockHash` = `H2(all 144 bytes)`. Identifies and links blocks; carries no work.
+- `preHeader` = bytes `[0, 144)` (everything except `k`).
+- `blockHash` = `H2(all 176 bytes)`. Identifies and links blocks; carries no work.
 
 ### 4.2 Block
-`header (144 bytes)` ‖ `varint(len(txs))` ‖ for each tx: `varint(len(tx))` ‖ `tx bytes`.
-`varint` = Bitcoin CompactSize. v0.1 limits: 1 ≤ `len(txs)` ≤ 1000, each tx ≤ 100 000 bytes,
+`header (176 bytes)` ‖ `varint(len(txs))` ‖ for each tx: `varint(len(tx))` ‖ `tx bytes`.
+`varint` = Bitcoin CompactSize. Limits: 1 ≤ `len(txs)` ≤ 1000, each tx ≤ 100 000 bytes,
 serialized block ≤ 1 000 000 bytes.
 
 ### 4.3 Merkle root
 Bitcoin-style: leaves `H2(tx)`; while more than one node, duplicate the last node if the count is odd,
 then pair-hash `H2(left ‖ right)`. Root of a one-tx block = `H2(tx0)`.
 
-### 4.4 Coinbase convention (not enforced in v0.1)
-`"coinbase|" ‖ u32le(height) ‖ "|" ‖ minerAddressUTF8 ‖ "|" ‖ extra`. The miner identity binds to the
-puzzle via `merkle_root` → `preHeader` → `P` (this is what makes a broadcast `k` unstealable).
+### 4.4 Transactions
+All integers are little-endian; `u128` is 16 bytes. Every byte of a transaction is significant:
+lengths are exact, and unknown `kind` or `scheme` values, or trailing bytes, are invalid.
+
+**Keys and addresses.** Scheme `1` = SLH-DSA-SHA2-128s (FIPS 205; public key 32 B, signature
+7 856 B). `address = H(tag("addr") ‖ u8 scheme ‖ pubkey)` (32 bytes). The scheme byte leaves room
+for future schemes; it is part of the address so the same key bytes can never mean two things.
+
+**Coinbase** (`kind = 0`), exactly once, as `txs[0]` (55–119 bytes):
+`u8 kind=0 ‖ u32 height ‖ 32B to ‖ u128 amount ‖ u8 extraLen ‖ extra` with `extraLen ≤ 64`.
+`height` must equal the block height. The recipient binds to the puzzle via `merkle_root` →
+`preHeader` → `P`, which is what makes a broadcast `k` unstealable.
+
+**Transfer** (`kind = 1`, 7 962 bytes):
+`u8 kind=1 ‖ u8 scheme=1 ‖ 32B pubkey ‖ 32B to ‖ u128 amount ‖ u128 fee ‖ u64 nonce ‖ sig`.
+- `body` = the transfer without `sig`; `digest = H(tag("tx") ‖ genesisHash ‖ body)`, where
+  `genesisHash` is the `blockHash` of the chain's height-0 block (replay protection across chains).
+- `sig` is the FIPS 205 *pure* SLH-DSA signature of the 32-byte `digest` with an empty context
+  string (i.e. over `M' = 0x00 ‖ 0x00 ‖ digest`). Hedged and deterministic signatures both verify.
+- The genesis block may contain only its coinbase.
 
 ## 5. Consensus rules
 
@@ -199,12 +222,48 @@ In this order (order matters only for which error is reported; vectors don't req
 5. If chain non-empty: `time > median(last min(11, h) times)` where median = sorted[len/2].
 6. If `h mod Epoch == 0` and chain non-empty: `time ≥ chain[h−1].time − TimewarpSlack`.
 7. Live blocks only (not when replaying stored/vector chains): `time ≤ now + FutureLimit`.
-8. Curve/order validity (§5.1–5.2).
-9. Puzzle (§5.3).
+8. `version == 2`; every tx decodes (§4.4); `txs[0]` is the only coinbase and its `height` is `h`;
+   no transfers in the genesis block.
+9. Curve/order validity (§5.1–5.2).
+10. Puzzle (§5.3).
+11. State transition (§5.7) succeeds from the parent's state and the result's root equals
+    `state_root`. (After the puzzle so that expensive signature checks cost the sender a solved
+    block.)
 
 ### 5.6 Work and fork choice
 `work(block) = isqrt(n)`. Chain work = sum over blocks. Nodes follow the valid chain with the most
 cumulative work; ties → keep the first seen.
+
+### 5.7 Accounts and state
+State maps `address → (balance u128, nonce u64)`; an absent account is `(0, 0)`, and an account
+that returns to `(0, 0)` is removed. The state before genesis is empty. A block is applied to its
+parent's state as follows:
+
+1. For each transfer, in block order: `from = address(scheme, pubkey)`; the signature verifies
+   (§4.4); `nonce == state[from].nonce`; `amount + fee ≤ state[from].balance`. Then
+   `state[from] = (balance − amount − fee, nonce + 1)` and `state[to].balance += amount`. Any
+   failure, or a result above `2^128 − 1` (balance) or `2^64 − 1` (nonce), invalidates the block.
+   Self-transfers are allowed.
+2. The coinbase must pay exactly `amount == reward + Σ fees` (§5.8). It is credited **after** all
+   transfers, so a block cannot spend its own reward.
+
+**State root**: a compact sparse Merkle tree keyed by the 256 address bits, most significant bit
+first (bit `i` = `(addr[i/8] >> (7 − i mod 8)) & 1`):
+```
+leaf(a)      = H(tag("leaf") ‖ address ‖ u128 balance ‖ u64 nonce)
+node(L, R)   = H(tag("node") ‖ L ‖ R)
+root(S, d)   = 32 zero bytes                              if S is empty
+             = leaf(a)                                    if S = {a}
+             = node(root(S0, d+1), root(S1, d+1))         otherwise, S0/S1 = accounts with bit d = 0/1
+state_root   = root(all accounts, 0)
+```
+The root is independent of insertion order, and inclusion and absence proofs are possible later
+without a format change.
+
+### 5.8 Issuance
+`reward(block) = work(block) = isqrt(n)` base units. Fees go to the miner. Hence **total supply
+equals cumulative chain work**: one unit of currency is one unit of discrete-log work. Rewards grow
+about 2× per 2 bits of difficulty, which is why amounts are `u128`.
 
 ## 6. Mining (non-consensus; any method is fine)
 
@@ -283,10 +342,9 @@ below is the network name from §2, so nodes of different networks never exchang
   offers no post-quantum key type. This is acceptable because they protect nothing consensus-critical:
   every block is validated regardless of sender, bans are only DoS mitigation, and relayed data is
   public.
-- **Future transactions must use post-quantum signatures from day one** (e.g. SLH-DSA / FIPS 205,
-  which relies only on hash security, or ML-DSA / FIPS 204). A chain that measures progress towards
-  breaking elliptic curves must not secure its own coins with them. The current block and transaction
-  size limits (§4.2) will need revisiting for those signature sizes.
+- **Transactions use post-quantum signatures from day one:** SLH-DSA-SHA2-128s (FIPS 205), whose
+  security rests only on SHA-256, the same assumption as the rest of consensus. A chain that
+  measures progress towards breaking elliptic curves must not secure its own coins with them.
 
 ## 10. HTTP API (localhost only by default)
 | Method | Path | Returns |
@@ -299,9 +357,9 @@ below is the network name from §2, so nodes of different networks never exchang
 
 ## 11. JSON chain format (interop with the Python reference)
 ```json
-{"params": {...}, "blocks": [{"hash": "...", "header_hex": "...", "version": 1, "prev_hash": "...",
-  "merkle_root": "...", "time": 0, "bits": 36, "curve_ctr": 0, "n": "decimal", "k": "decimal",
-  "txs": ["hex", ...]}]}
+{"params": {...}, "blocks": [{"hash": "...", "header_hex": "...", "version": 2, "prev_hash": "...",
+  "merkle_root": "...", "state_root": "...", "time": 0, "bits": 36, "curve_ctr": 0,
+  "n": "decimal", "k": "decimal", "txs": ["hex", ...]}]}
 ```
 `header_hex` + `txs` are authoritative; other fields are informational. `params` keys:
 `tau, epoch, genesis_bits, min_bits, max_bits, max_curve_ctr, max_step, timewarp_slack, mtp_window, future_limit`.
@@ -309,9 +367,10 @@ below is the network name from §2, so nodes of different networks never exchang
 ## 12. CLI
 ```
 canary node    [--datadir DIR] [--listen MULTIADDR,...] [--api 127.0.0.1:18556]
-              [--peers MULTIADDR/p2p/ID,...] [--mine] [--miner-address STR] [--threads N]
+              [--peers MULTIADDR/p2p/ID,...] [--mine --miner-address ADDR] [--threads N]
               [--profile prototype|mainnet]
-canary mine    --chain FILE.json [--blocks N] [--threads N] [--miner-address STR]   # offline, like reference
+canary mine    --chain FILE.json --miner-address ADDR [--blocks N] [--threads N]   # offline, like reference
+canary keygen  --out FILE                                                           # SLH-DSA key, prints address
 canary verify  FILE.json                                                             # prints cumulative work
 canary export  --datadir DIR FILE.json
 canary vectors [reference/test_vectors.json]                                         # conformance run
@@ -339,11 +398,17 @@ reference/            canary.py gen_vectors.py test_vectors.json   (do not modif
 | `retarget_delta[]` | `{expected, actual_clamped, delta}` | `RetargetDelta(expected, actual_clamped, 4) == delta` |
 | `curves[]` | `{prev_hash, bits, curve_ctr, p, a, b, G}`; entries with `"valid": true` also have `n` | `DeriveCurve` reproduces `p,a,b,G` (`G` null ⇒ invalid curve); valid entries pass §5.2; miner search finds the same first `curve_ctr` |
 | `hash_to_curve[]` | `{msg, p, a, b, x, y}` | `HashToCurve` |
-| `chain.blocks[]` | 70 blocks, genesis at 36 bits, retarget to 40 at height 64 | Full replay validates; `cumulative_work` matches; block hashes match |
-| `invalid_blocks` | `parent_height` + `cases[] {name, header_hex, txs, reason}` | Each case, validated on top of `chain.blocks[0..parent_height]`, is rejected. `reason` is informative only |
+| `keys[]` | `{sk_seed, sk_prf, pk_seed, pubkey, address}` | SLH-DSA keygen from seeds and `address` |
+| `state_roots[]` | `{accounts [[address, balance, nonce]], root}` | `StateRoot` |
+| `transactions[]` | transfers `{genesis_hash, tx, sender, to, amount, fee, nonce, digest, valid_signature}` and a coinbase | Decode, re-encode, digest, signature check |
+| `chain` | 70 blocks (genesis at 36 bits, retarget to 40 at height 64) with transfers in blocks 3, 4 and 69; `cumulative_work`, `supply`, final `state` | Full replay validates; hashes, work, supply (= work) and state match |
+| `invalid_blocks.cases[]` | `{name, parent_height, header_hex, txs, reason}` | Each case, validated on `chain.blocks[0..parent_height]` and its state, is rejected (`reason` is informative). State-rule cases carry a valid puzzle so they fail only at rule 11 |
 
-Regenerate only via `python3 reference/gen_vectors.py` (re-mines; output differs run to run but is
-always self-consistent). The checked-in file is canonical.
+The Python SLH-DSA is separately checked against NIST ACVP vectors (`reference/test_slhdsa.py`,
+`reference/testdata/`).
+
+Regenerate only via `cd reference && python3 gen_vectors.py` (re-mines and re-signs, about 10
+minutes; output differs run to run but is always self-consistent). The checked-in file is canonical.
 
 ## 15. Milestones and acceptance criteria
 Work in this order; each milestone ends with green `go test ./...` and `go vet ./...`.
@@ -365,8 +430,21 @@ tip within 30 s; a node started later syncs from scratch; a peer sending an inva
 
 **M5 — API + stats.** Endpoints of §10; `/stats` numbers sanity-checked against a known chain.
 
-## 16. Known limitations (by design for v0.1)
+**A1 — Accounts (consensus, v0.2).** §4.4 and §5.7–§5.8 in the Python reference (with its own
+SLH-DSA, passing the NIST ACVP vectors) and in Go; regenerated vectors pass in both; a Go-signed
+transfer in a Go-mined chain verifies in Python.
+
+**A2 — Wallet, mempool and transaction relay.** Key management and transfer creation in the CLI, a
+mempool with nonce ordering and fee priority, a GossipSub transaction topic, and miners including
+mempool transfers.
+
+## 16. Known limitations (by design for v0.2)
+- The state root is recomputed from scratch each block (O(accounts · log accounts) hashes); an
+  incremental tree is an implementation change, not a format change.
+- No coinbase maturity: a reorg can undo rewards that were already spent.
 - Mining is not progress-free; larger miners win super-linearly. Accepted (benchmark goal).
-- No transactions or coin accounting yet; `txs` are opaque.
+- SLH-DSA signing is slow (about 3 s per signature in Go, 7 s in the Python reference);
+  verification is fast (about 2.5 ms in Go). Signatures dominate block space: about 125 transfers per
+  1 MB block.
 - Whole-bit difficulty: block times can oscillate ≈ ±20% between epochs.
 - Inherited assumptions: timestamps can be gamed within MTP/future limits as in Bitcoin.

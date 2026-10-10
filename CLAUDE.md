@@ -9,9 +9,11 @@ source of truth.
   acceptance criteria pass. Commit at the end of each milestone.
 - `reference/` is read-only. `reference/canary.py` is the consensus oracle and
   `reference/test_vectors.json` is canonical. Never edit them to make tests pass.
-  (The vectors were regenerated once on 2026-10-10 for the ECPoW → Canary rename of the `tag()`
-  prefix; that file is now canonical.)
+  (They change only with a deliberate spec revision, regenerated with `gen_vectors.py`: the
+  ECPoW → Canary rename and v0.2 accounts, both 2026-10-10.)
 - Networking uses libp2p (`internal/p2p`); `internal/consensus` must never import it.
+- The one non-stdlib consensus dependency is CIRCL's SLH-DSA, used only in
+  `internal/consensus/slhdsa.go` (CI enforces this).
 - Consensus code (`internal/consensus`) uses only the Go standard library, integer math, and no
   randomness. Never use `big.Int.ProbablyPrime` there (SPEC.md §3.3).
 - If SPEC.md is ambiguous, match the Python reference and leave a `// SPEC:` comment explaining it.

@@ -8,7 +8,8 @@ Difficulty = one integer: the bit-size b of the curve's group order n.
 Consensus-relevant pieces (must match the spec bit for bit):
   serialization, H/H2, is_prime (BPSW), next_prime_3mod4, derive_curve,
   hash_to_curve, check_curve, puzzle_point, retarget_delta, next_bits,
-  block_work, validate_block / validate_chain.
+  block_work, transactions, accounts and state_root, validate_block / validate_chain.
+  Signatures: SLH-DSA-SHA2-128s from slhdsa.py (FIPS 205).
 
 Non-consensus pieces (any method is fine):
   find_curve (point counting via BSGS), rho miner, CLI.
@@ -29,6 +30,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 from math import isqrt
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import slhdsa  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -79,6 +83,14 @@ def int_be(b: bytes) -> int:
 
 def le32(x: int) -> bytes:
     return x.to_bytes(32, "little")
+
+
+def u64(x: int) -> bytes:
+    return x.to_bytes(8, "little")
+
+
+def u128(x: int) -> bytes:
+    return x.to_bytes(16, "little")
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +412,8 @@ def find_curve(prev_hash: bytes, bits: int, params: Params = PROTOTYPE):
 # Blocks
 # ---------------------------------------------------------------------------
 
-HEADER_SIZE = 144
+HEADER_SIZE = 176
+VERSION = 2
 
 
 @dataclass
@@ -408,6 +421,7 @@ class Header:
     version: int
     prev_hash: bytes
     merkle_root: bytes
+    state_root: bytes
     time: int
     bits: int
     curve_ctr: int
@@ -415,8 +429,8 @@ class Header:
     k: int
 
     def pre_header(self) -> bytes:
-        return (u32(self.version) + self.prev_hash + self.merkle_root + u32(self.time)
-                + u32(self.bits) + u32(self.curve_ctr) + le32(self.n))
+        return (u32(self.version) + self.prev_hash + self.merkle_root + self.state_root
+                + u32(self.time) + u32(self.bits) + u32(self.curve_ctr) + le32(self.n))
 
     def serialize(self) -> bytes:
         return self.pre_header() + le32(self.k)
@@ -428,9 +442,9 @@ class Header:
     def deserialize(cls, b: bytes) -> "Header":
         assert len(b) == HEADER_SIZE
         v, = struct.unpack_from("<I", b, 0)
-        t, bits, ctr = struct.unpack_from("<III", b, 68)
-        return cls(v, b[4:36], b[36:68], t, bits, ctr,
-                   int.from_bytes(b[80:112], "little"), int.from_bytes(b[112:144], "little"))
+        t, bits, ctr = struct.unpack_from("<III", b, 100)
+        return cls(v, b[4:36], b[36:68], b[68:100], t, bits, ctr,
+                   int.from_bytes(b[112:144], "little"), int.from_bytes(b[144:176], "little"))
 
 
 @dataclass
@@ -444,7 +458,8 @@ class Block:
             "hash": h.hash().hex(),            # raw byte order (no Bitcoin-style reversal)
             "header_hex": h.serialize().hex(),
             "version": h.version, "prev_hash": h.prev_hash.hex(),
-            "merkle_root": h.merkle_root.hex(), "time": h.time, "bits": h.bits,
+            "merkle_root": h.merkle_root.hex(), "state_root": h.state_root.hex(),
+            "time": h.time, "bits": h.bits,
             "curve_ctr": h.curve_ctr, "n": str(h.n), "k": str(h.k),
             "txs": [t.hex() for t in self.txs],
         }
@@ -466,8 +481,160 @@ def merkle_root(txs: list) -> bytes:
     return layer[0]
 
 
-def coinbase(height: int, miner: str, extra: bytes = b"") -> bytes:
-    return b"coinbase|" + u32(height) + b"|" + miner.encode() + b"|" + extra
+# ---------------------------------------------------------------------------
+# Transactions, accounts and state (consensus, v0.2)
+# ---------------------------------------------------------------------------
+
+SCHEME_SLHDSA = 1
+MAX_EXTRA = 64
+U128_MAX = (1 << 128) - 1
+U64_MAX = (1 << 64) - 1
+TRANSFER_SIZE = 1 + 1 + 32 + 32 + 16 + 16 + 8 + slhdsa.SIG_BYTES
+
+
+def address(pubkey: bytes, scheme: int = SCHEME_SLHDSA) -> bytes:
+    return H(tag("addr") + bytes([scheme]) + pubkey)
+
+
+@dataclass
+class Coinbase:
+    height: int
+    to: bytes
+    amount: int
+    extra: bytes = b""
+
+    def serialize(self) -> bytes:
+        return (b"\x00" + u32(self.height) + self.to + u128(self.amount)
+                + bytes([len(self.extra)]) + self.extra)
+
+
+@dataclass
+class Transfer:
+    pubkey: bytes
+    to: bytes
+    amount: int
+    fee: int
+    nonce: int
+    sig: bytes = b""
+    scheme: int = SCHEME_SLHDSA
+
+    def body(self) -> bytes:
+        return (b"\x01" + bytes([self.scheme]) + self.pubkey + self.to + u128(self.amount)
+                + u128(self.fee) + u64(self.nonce))
+
+    def serialize(self) -> bytes:
+        return self.body() + self.sig
+
+    def sender(self) -> bytes:
+        return address(self.pubkey, self.scheme)
+
+
+def tx_digest(genesis_hash: bytes, tx: Transfer) -> bytes:
+    return H(tag("tx") + genesis_hash + tx.body())
+
+
+def sign_transfer(tx: Transfer, sk: bytes, genesis_hash: bytes, addrnd=None) -> Transfer:
+    """Sign in place (slow in pure Python: tens of seconds)."""
+    tx.sig = slhdsa.sign(tx_digest(genesis_hash, tx), sk, b"", addrnd)
+    return tx
+
+
+def decode_tx(b: bytes):
+    """Decode a tx exactly (§4.4); raises Invalid."""
+    if not b:
+        raise Invalid("empty tx")
+    if b[0] == 0:
+        if len(b) < 54:
+            raise Invalid("coinbase too short")
+        extra_len = b[53]
+        if extra_len > MAX_EXTRA or len(b) != 54 + extra_len:
+            raise Invalid("bad coinbase length")
+        return Coinbase(struct.unpack_from("<I", b, 1)[0], b[5:37],
+                        int.from_bytes(b[37:53], "little"), b[54:])
+    if b[0] == 1:
+        if len(b) != TRANSFER_SIZE:
+            raise Invalid("bad transfer length")
+        if b[1] != SCHEME_SLHDSA:
+            raise Invalid("unknown signature scheme")
+        return Transfer(b[2:34], b[34:66], int.from_bytes(b[66:82], "little"),
+                        int.from_bytes(b[82:98], "little"), int.from_bytes(b[98:106], "little"),
+                        b[106:], b[1])
+    raise Invalid("unknown tx kind")
+
+
+def decode_txs(blk: "Block", height: int) -> list:
+    """Rule 8: decode every tx; txs[0] is the only coinbase, for this height."""
+    txs = [decode_tx(t) for t in blk.txs]
+    if not isinstance(txs[0], Coinbase):
+        raise Invalid("first tx is not a coinbase")
+    if txs[0].height != height:
+        raise Invalid("coinbase height mismatch")
+    if any(isinstance(t, Coinbase) for t in txs[1:]):
+        raise Invalid("extra coinbase")
+    if height == 0 and len(txs) > 1:
+        raise Invalid("transfers in genesis block")
+    return txs
+
+
+def apply_txs(state: dict, txs: list, reward: int, genesis_hash: bytes) -> dict:
+    """§5.7: apply decoded txs to state (address -> (balance, nonce)); returns a new state."""
+    st = dict(state)
+    fees = 0
+    for tx in txs[1:]:
+        if not slhdsa.verify(tx_digest(genesis_hash, tx), tx.sig, tx.pubkey):
+            raise Invalid("bad signature")
+        frm = tx.sender()
+        bal, nonce = st.get(frm, (0, 0))
+        if tx.nonce != nonce:
+            raise Invalid("bad nonce")
+        if tx.amount + tx.fee > bal:
+            raise Invalid("insufficient balance")
+        if nonce + 1 > U64_MAX:
+            raise Invalid("nonce overflow")
+        _put(st, frm, bal - tx.amount - tx.fee, nonce + 1)
+        tbal, tnonce = st.get(tx.to, (0, 0))
+        if tbal + tx.amount > U128_MAX:
+            raise Invalid("balance overflow")
+        _put(st, tx.to, tbal + tx.amount, tnonce)
+        fees += tx.fee
+    cb = txs[0]
+    if cb.amount != reward + fees:
+        raise Invalid("coinbase amount != reward + fees")
+    tbal, tnonce = st.get(cb.to, (0, 0))
+    if tbal + cb.amount > U128_MAX:
+        raise Invalid("balance overflow")
+    _put(st, cb.to, tbal + cb.amount, tnonce)
+    return st
+
+
+def _put(st: dict, addr: bytes, bal: int, nonce: int) -> None:
+    if bal == 0 and nonce == 0:
+        st.pop(addr, None)
+    else:
+        st[addr] = (bal, nonce)
+
+
+def _bit(addr: bytes, i: int) -> int:
+    return (addr[i // 8] >> (7 - i % 8)) & 1
+
+
+def state_root(state: dict) -> bytes:
+    """Compact sparse Merkle tree over 256-bit addresses (§5.7)."""
+    def root(items: list, d: int) -> bytes:
+        if not items:
+            return b"\x00" * 32
+        if len(items) == 1:
+            a, (bal, nonce) = items[0]
+            return H(tag("leaf") + a + u128(bal) + u64(nonce))
+        left = [it for it in items if _bit(it[0], d) == 0]
+        right = [it for it in items if _bit(it[0], d) == 1]
+        return H(tag("node") + root(left, d + 1) + root(right, d + 1))
+    return root(sorted(state.items()), 0)
+
+
+def block_reward(h: "Header") -> int:
+    """§5.8: reward = work = isqrt(n)."""
+    return isqrt(h.n)
 
 
 def puzzle_point(C: Curve, h: Header):
@@ -524,7 +691,11 @@ class Invalid(Exception):
 
 
 def validate_block(chain: list, blk: Block, params: Params = PROTOTYPE,
-                   now: int | None = None) -> None:
+                   now: int | None = None, state: dict | None = None) -> dict:
+    """Validate blk on top of chain, whose post-state is `state` (recomputed by replay if None).
+    Returns the state after blk."""
+    if state is None:
+        state = chain_state(chain)
     h = blk.header
     height = len(chain)
     prev_hash = chain[-1].header.hash() if chain else b"\x00" * 32
@@ -546,6 +717,10 @@ def validate_block(chain: list, blk: Block, params: Params = PROTOTYPE,
             raise Invalid("timewarp rule")
     if now is not None and h.time > now + params.future_limit:
         raise Invalid("time too far in future")
+    # transactions (structure only; signatures are checked in the state transition)
+    if h.version != VERSION:
+        raise Invalid("bad version")
+    txs = decode_txs(blk, height)
     # curve + order
     C = derive_curve(h.prev_hash, h.bits, h.curve_ctr)
     reason = check_curve(C, h.n, h.bits)
@@ -557,16 +732,35 @@ def validate_block(chain: list, blk: Block, params: Params = PROTOTYPE,
     P = puzzle_point(C, h)
     if ec_mul(C, h.k, C.G) != P:
         raise Invalid("k*G != P")
+    # state transition
+    genesis_hash = chain[0].header.hash() if chain else h.hash()
+    new_state = apply_txs(state, txs, block_reward(h), genesis_hash)
+    if state_root(new_state) != h.state_root:
+        raise Invalid("state_root mismatch")
+    return new_state
 
 
-def validate_chain(blocks: list, params: Params = PROTOTYPE) -> int:
+def chain_state(blocks: list) -> dict:
+    """State after a chain that is already known to be valid."""
+    state = {}
+    if not blocks:
+        return state
+    genesis_hash = blocks[0].header.hash()
+    for i, blk in enumerate(blocks):
+        state = apply_txs(state, decode_txs(blk, i), block_reward(blk.header), genesis_hash)
+    return state
+
+
+def validate_chain(blocks: list, params: Params = PROTOTYPE) -> tuple:
+    """Returns (cumulative work, final state)."""
     chain = []
     work = 0
+    state = {}
     for blk in blocks:
-        validate_block(chain, blk, params)
+        state = validate_block(chain, blk, params, state=state)
         chain.append(blk)
         work += block_work(blk.header)
-    return work
+    return work, state
 
 
 # ---------------------------------------------------------------------------
@@ -649,8 +843,13 @@ def rho_solve(C: Curve, P, n: int, workers: int = 1, verbose: bool = False) -> i
                 pr.terminate()
 
 
-def mine_block(chain: list, miner: str, params: Params = PROTOTYPE, workers: int = 1,
-               timestamp: int | None = None, verbose: bool = True) -> Block:
+def mine_block(chain: list, miner: bytes, params: Params = PROTOTYPE, workers: int = 1,
+               timestamp: int | None = None, verbose: bool = True, state: dict | None = None,
+               transfers: list = ()) -> Block:
+    """Mine the next block paying the reward plus fees to address `miner` (32 bytes).
+    `transfers` must be signed Transfer objects valid on top of `state`."""
+    if state is None:
+        state = chain_state(chain)
     height = len(chain)
     prev_hash = chain[-1].header.hash() if chain else b"\x00" * 32
     bits = next_bits(chain, params)
@@ -662,15 +861,23 @@ def mine_block(chain: list, miner: str, params: Params = PROTOTYPE, workers: int
     if chain:
         window = [b.header.time for b in chain[-params.mtp_window:]]
         timestamp = max(timestamp, sorted(window)[len(window) // 2] + 1)
-    txs = [coinbase(height, miner)]
-    h = Header(1, prev_hash, merkle_root(txs), timestamp, bits, ctr, n, 0)
+        if height % params.epoch == 0:
+            timestamp = max(timestamp, chain[-1].header.time - params.timewarp_slack)
+    cb = Coinbase(height, miner, isqrt(n) + sum(t.fee for t in transfers))
+    txs = [cb] + list(transfers)
+    genesis_hash = chain[0].header.hash() if chain else None
+    if height == 0 and transfers:
+        raise ValueError("genesis cannot contain transfers")
+    new_state = apply_txs(state, txs, isqrt(n), genesis_hash or b"")
+    raw = [t.serialize() for t in txs]
+    h = Header(VERSION, prev_hash, merkle_root(raw), state_root(new_state), timestamp, bits, ctr, n, 0)
     P = puzzle_point(C, h)
     h.k = rho_solve(C, P, n, workers, verbose)
     t2 = time.time()
     if verbose:
-        print(f"block {height:4d}  bits={bits}  ctr={ctr:<4d} curve {t1-t0:5.2f}s  "
+        print(f"block {height:4d}  bits={bits}  ctr={ctr:<4d} txs={len(txs)} curve {t1-t0:5.2f}s  "
               f"rho {t2-t1:6.2f}s  hash={h.hash().hex()[:16]}", file=sys.stderr)
-    return Block(h, txs)
+    return Block(h, raw)
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +902,7 @@ def main(argv=None):
     m.add_argument("chain")
     m.add_argument("-n", "--blocks", type=int, default=10)
     m.add_argument("-w", "--workers", type=int, default=os.cpu_count() or 1)
-    m.add_argument("--miner", default="miner-address")
+    m.add_argument("--miner", default="00" * 32, help="miner address (64 hex chars)")
     m.add_argument("--epoch", type=int, default=PROTOTYPE.epoch)
     m.add_argument("--tau", type=int, default=PROTOTYPE.tau)
     m.add_argument("--genesis-bits", type=int, default=PROTOTYPE.genesis_bits)
@@ -710,16 +917,21 @@ def main(argv=None):
             with open(args.chain) as f:
                 params = Params(**json.load(f)["params"])
             blocks = _load(args.chain)
+        miner = bytes.fromhex(args.miner)
+        if len(miner) != 32:
+            sys.exit("--miner must be 32 bytes of hex")
+        state = chain_state(blocks)
         for _ in range(args.blocks):
-            blk = mine_block(blocks, args.miner, params, args.workers)
-            validate_block(blocks, blk, params)
+            blk = mine_block(blocks, miner, params, args.workers, state=state)
+            state = validate_block(blocks, blk, params, state=state)
             blocks.append(blk)
             _save(args.chain, blocks, params)
     else:
         with open(args.chain) as f:
             params = Params(**json.load(f)["params"])
-        work = validate_chain(_load(args.chain), params)
-        print(f"valid chain, cumulative work {work}")
+        work, state = validate_chain(_load(args.chain), params)
+        supply = sum(bal for bal, _ in state.values())
+        print(f"valid chain, cumulative work {work}, {len(state)} accounts, supply {supply}")
 
 
 if __name__ == "__main__":
