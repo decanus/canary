@@ -41,6 +41,10 @@ func blocksTopic(network string) string {
 	return "/canary/" + network + "/blocks/1.0.0"
 }
 
+func txsTopic(network string) string {
+	return "/canary/" + network + "/txs/1.0.0"
+}
+
 // Status describes a node's active chain: u32le version ‖ u32le height ‖ tip hash ‖
 // u8 len ‖ cumulative work (big-endian). Height is the chain length (0 for an empty chain).
 type Status struct {

@@ -471,3 +471,14 @@ func (m *Manager) GenesisHash() (hash [32]byte, ok bool) {
 	}
 	return m.active[0].hash, true
 }
+
+// TipState returns the active chain's genesis hash and the state after its tip; ok is false for
+// an empty chain. The state is shared and must not be modified.
+func (m *Manager) TipState() (genesis [32]byte, st consensus.State, ok bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.active) == 0 {
+		return genesis, m.state, false
+	}
+	return m.active[0].hash, m.state, true
+}

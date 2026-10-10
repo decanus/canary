@@ -20,11 +20,13 @@ import (
 
 	"github.com/decanus/canary/internal/chain"
 	"github.com/decanus/canary/internal/consensus"
+	"github.com/decanus/canary/internal/mempool"
 )
 
 // Config configures a Node. Zero values get the defaults noted.
 type Config struct {
 	DataDir     string        // holds node.key and peers.json
+	Pool        *mempool.Pool // receives gossiped transfers; nil disables transaction relay
 	Listen      []string      // multiaddrs, e.g. /ip4/0.0.0.0/tcp/18555
 	Peers       []string      // static peers, multiaddrs ending in /p2p/<id>
 	MaxPeers    int           // default 16
@@ -42,6 +44,8 @@ type Node struct {
 	gater  *gater
 	topic  *pubsub.Topic
 	sub    *pubsub.Subscription
+	txs    *pubsub.Topic // nil without a pool
+	txSub  *pubsub.Subscription
 	static []peer.AddrInfo
 
 	ctx    context.Context
@@ -144,6 +148,18 @@ func New(cm *chain.Manager, cfg Config) (*Node, error) {
 	if n.sub, err = n.topic.Subscribe(); err != nil {
 		return fail(err)
 	}
+	if cfg.Pool != nil {
+		txTopic := txsTopic(netName)
+		if err := ps.RegisterTopicValidator(txTopic, n.validateTx); err != nil {
+			return fail(err)
+		}
+		if n.txs, err = ps.Join(txTopic); err != nil {
+			return fail(err)
+		}
+		if n.txSub, err = n.txs.Subscribe(); err != nil {
+			return fail(err)
+		}
+	}
 
 	h.SetStreamHandler(statusProtocol(netName), n.handleStatus)
 	h.SetStreamHandler(syncProtocol(netName), n.handleSync)
@@ -156,7 +172,10 @@ func New(cm *chain.Manager, cfg Config) (*Node, error) {
 		},
 	})
 
-	n.spawn(n.drain)
+	n.spawn(func() { drain(n.ctx, n.sub) })
+	if n.txSub != nil {
+		n.spawn(func() { drain(n.ctx, n.txSub) })
+	}
 	n.spawn(n.poll)
 	for _, info := range append(static, saved...) {
 		n.spawn(func() { n.dial(info) })
@@ -219,6 +238,14 @@ func (n *Node) Publish(blk *consensus.Block) error {
 	return n.topic.Publish(n.ctx, blk.Serialize())
 }
 
+// PublishTx gossips a transfer that the pool has already accepted.
+func (n *Node) PublishTx(t *consensus.Transfer) error {
+	if n.txs == nil {
+		return errors.New("p2p: transaction relay disabled")
+	}
+	return n.txs.Publish(n.ctx, t.Serialize())
+}
+
 // Close saves the connected peers to peers.json and shuts the node down. When it returns, no
 // goroutine of the node is still using the chain manager.
 func (n *Node) Close() error {
@@ -231,6 +258,9 @@ func (n *Node) Close() error {
 	n.mu.Unlock()
 	n.cancel()
 	n.sub.Cancel()
+	if n.txSub != nil {
+		n.txSub.Cancel()
+	}
 	err = errors.Join(err, n.host.Close())
 	n.wg.Wait()
 	return err
@@ -244,10 +274,10 @@ func (n *Node) dial(info peer.AddrInfo) {
 	}
 }
 
-// drain consumes the subscription; blocks are processed in the validator.
-func (n *Node) drain() {
+// drain consumes a subscription; messages are processed in the topic validators.
+func drain(ctx context.Context, sub *pubsub.Subscription) {
 	for {
-		if _, err := n.sub.Next(n.ctx); err != nil {
+		if _, err := sub.Next(ctx); err != nil {
 			return
 		}
 	}
@@ -314,7 +344,35 @@ func (n *Node) validate(_ context.Context, from peer.ID, msg *pubsub.Message) pu
 	return pubsub.ValidationAccept
 }
 
-// punish bans and disconnects a peer that sent an invalid block.
+// validateTx is the transaction topic validator: it adds the transfer to the pool. Bad encodings
+// and signatures are punished; state-dependent rejections (nonce, balance, pool limits) are
+// ignored, since honest nodes can briefly disagree about state.
+func (n *Node) validateTx(_ context.Context, from peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
+	if !n.enter() {
+		return pubsub.ValidationIgnore
+	}
+	defer n.wg.Done()
+	if from == n.host.ID() {
+		return pubsub.ValidationAccept // published by us after Pool.Add
+	}
+	tx, err := consensus.DecodeTx(msg.Data)
+	t, ok := tx.(*consensus.Transfer)
+	if err != nil || !ok {
+		n.punish(from, fmt.Errorf("undecodable transfer: %v", err))
+		return pubsub.ValidationReject
+	}
+	switch err := n.cfg.Pool.Add(t); {
+	case err == nil:
+		return pubsub.ValidationAccept
+	case errors.Is(err, mempool.ErrInvalid):
+		n.punish(from, err)
+		return pubsub.ValidationReject
+	default:
+		return pubsub.ValidationIgnore
+	}
+}
+
+// punish bans and disconnects a peer that sent an invalid block or transfer.
 func (n *Node) punish(p peer.ID, err error) {
 	n.cfg.Logf("p2p: banning %s: %v", p, err)
 	n.gater.ban(p, n.cfg.BanDuration)

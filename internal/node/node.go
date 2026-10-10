@@ -4,11 +4,14 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
+	"github.com/decanus/canary/internal/api"
 	"github.com/decanus/canary/internal/chain"
 	"github.com/decanus/canary/internal/consensus"
+	"github.com/decanus/canary/internal/mempool"
 	"github.com/decanus/canary/internal/miner"
 	"github.com/decanus/canary/internal/p2p"
 )
@@ -22,6 +25,7 @@ type Config struct {
 	MinerAddress consensus.Address
 	Threads      int
 	MineDelay    time.Duration // pause after each mined block (tests use it to pace mining)
+	API          string        // listen address for the HTTP API (host:port); empty disables it
 	Now          func() int64  // default time.Now().Unix
 	Logf         func(format string, args ...any)
 }
@@ -29,8 +33,13 @@ type Config struct {
 // Node is a running full node.
 type Node struct {
 	Chain *chain.Manager
+	Pool  *mempool.Pool
 	P2P   *p2p.Node
+	API   *api.Server // nil if disabled
 	cfg   Config
+
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // Open opens the data directory and starts networking.
@@ -48,14 +57,45 @@ func Open(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	pool := mempool.New()
+	if genesis, st, ok := cm.TipState(); ok {
+		pool.Update(genesis, st)
+	}
 	pc := cfg.P2P
-	pc.DataDir, pc.Now, pc.Logf = cfg.DataDir, cfg.Now, cfg.Logf
+	pc.DataDir, pc.Now, pc.Logf, pc.Pool = cfg.DataDir, cfg.Now, cfg.Logf, pool
 	pn, err := p2p.New(cm, pc)
 	if err != nil {
 		cm.Close()
 		return nil, err
 	}
-	return &Node{Chain: cm, P2P: pn, cfg: cfg}, nil
+	n := &Node{Chain: cm, Pool: pool, P2P: pn, cfg: cfg, done: make(chan struct{})}
+	if cfg.API != "" {
+		if n.API, err = api.Listen(cfg.API, api.Backend{Chain: cm, Pool: pool, PublishTx: pn.PublishTx}); err != nil {
+			pn.Close()
+			cm.Close()
+			return nil, fmt.Errorf("api: %w", err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	n.cancel = cancel
+	go n.followTip(ctx)
+	return n, nil
+}
+
+// followTip keeps the mempool in step with the chain.
+func (n *Node) followTip(ctx context.Context) {
+	defer close(n.done)
+	events := n.Chain.Subscribe()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-events:
+			if genesis, st, ok := n.Chain.TipState(); ok {
+				n.Pool.Update(genesis, st)
+			}
+		}
+	}
 }
 
 // Run mines (if enabled) until ctx is cancelled; otherwise it just waits, since networking runs
@@ -69,10 +109,19 @@ func (n *Node) Run(ctx context.Context) error {
 	return nil
 }
 
-// Close stops networking and closes the data directory.
+// Close stops the API and networking and closes the data directory.
 func (n *Node) Close() error {
-	return errors.Join(n.P2P.Close(), n.Chain.Close())
+	var err error
+	if n.API != nil {
+		err = n.API.Close()
+	}
+	n.cancel()
+	<-n.done
+	return errors.Join(err, n.P2P.Close(), n.Chain.Close())
 }
+
+// maxTransferBytes leaves room in a block for the header, coinbase and length prefixes.
+const maxTransferBytes = consensus.MaxBlockSize - consensus.HeaderSize - 1024
 
 // mine repeatedly mines on the current tip, abandoning a solve when the tip changes, and
 // publishes every block it finds.
@@ -95,7 +144,11 @@ func (n *Node) mine(ctx context.Context) {
 			case <-done:
 			}
 		}()
-		res, err := miner.MineBlock(solveCtx, n.cfg.Params, headers, state, n.cfg.MinerAddress, nil, n.cfg.Threads, n.cfg.Now())
+		transfers := n.Pool.Select(state, maxTransferBytes)
+		if len(headers) == 0 {
+			transfers = nil // the genesis block may contain only its coinbase
+		}
+		res, err := miner.MineBlock(solveCtx, n.cfg.Params, headers, state, n.cfg.MinerAddress, transfers, n.cfg.Threads, n.cfg.Now())
 		close(done)
 		// Wait for the watcher so it cannot take a tip event meant for the next iteration.
 		<-watcherExited
@@ -117,7 +170,7 @@ func (n *Node) mine(ctx context.Context) {
 		}
 		if st == chain.NewTip {
 			h := res.Block.Hash()
-			n.cfg.Logf("mined block %d bits=%d hash=%x (rho %.2fs)", len(headers), res.Block.Header.Bits, h[:8], res.RhoTime.Seconds())
+			n.cfg.Logf("mined block %d bits=%d txs=%d hash=%x (rho %.2fs)", len(headers), res.Block.Header.Bits, len(res.Block.Txs), h[:8], res.RhoTime.Seconds())
 			if err := n.P2P.Publish(res.Block); err != nil {
 				n.cfg.Logf("miner: publish: %v", err)
 			}

@@ -12,7 +12,8 @@ capacity, and `256 − b` is the distance to secp256k1.
 
 > **Status:** prototype. Done: consensus, offline mining, storage and reorgs, libp2p networking,
 > and v0.2 accounts (post-quantum signed transfers, state root, issuance proportional to work).
-> Next: wallet, mempool and transaction relay; then the HTTP API. Not for production use.
+> Wallet, mempool and transaction relay work end to end. Next: the rest of the HTTP API (stats).
+> Not for production use.
 
 ## How it works
 
@@ -40,7 +41,9 @@ internal/miner/          curve search (2-torsion filter + baby-step giant-step o
 internal/chain/          append-only block store, block tree with side chains, fork choice by
                         cumulative work, reorgs, orphan pool, tip-change events
 internal/p2p/            libp2p networking: status and sync protocols, GossipSub block relay, bans
-internal/node/           full node: chain + p2p + mining loop
+internal/node/           full node: chain + mempool + p2p + API + mining loop
+internal/mempool/        pending transfers: per-sender nonce queues, fee-priority selection
+internal/api/            local HTTP API (tip, accounts, submit transfers) and its client
 internal/wallet/         SLH-DSA keys, transfer signing, key files
 internal/chainjson/     chain JSON format shared with the Python reference
 internal/conformance/   runner for reference/test_vectors.json
@@ -74,6 +77,17 @@ Running a network:
 canary node --mine --miner-address ADDR          # prints its /ip4/.../p2p/<id> addresses
 canary node --peers /ip4/1.2.3.4/tcp/18555/p2p/12D3Koo...
 ```
+
+Sending coins (the node's API listens on 127.0.0.1:18556 by default):
+
+```sh
+canary keygen --out alice.key                    # prints alice's address
+canary balance ADDR                              # balance, nonce, next nonce
+canary send --key alice.key --to ADDR --amount 1000 --fee 10
+```
+
+`send` signs with SLH-DSA (about 3 seconds), then hands the transfer to the node, which adds it
+to its mempool and gossips it. Miners include the highest-fee transfers they can afford.
 
 Nodes speak libp2p (TCP and QUIC). They find each other through `--peers` and remember
 peers in `peers.json`. New blocks spread by GossipSub; nodes that fall behind catch up with a
@@ -112,7 +126,7 @@ take `--profile`.
 - [x] **M3** Block storage, chain manager, reorgs
 - [x] **M4** Peer-to-peer block relay over libp2p
 - [x] **A1** Accounts: SLH-DSA signed transfers, state root, issuance proportional to work
-- [ ] **A2** Wallet CLI, mempool and transaction relay
+- [x] **A2** Wallet CLI, mempool and transaction relay
 - [ ] **M5** Local HTTP API with benchmark stats and balances
 
 ## Mining performance

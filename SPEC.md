@@ -304,6 +304,16 @@ fast path using fixed-width arithmetic (e.g. `math/bits` 128-bit Montgomery for 
   to it. Then try connecting orphans whose parent is now known.
 - Emit tip-change events (miner restarts, API, P2P announce).
 
+### 8.1 Mempool (non-consensus)
+- Transfers are queued per sender in nonce order with no gaps, starting at the account nonce, and
+  a sender's queued transfers must be affordable together. Limits: 5 000 transfers, 64 per sender;
+  when full, the lowest-fee queue tail is evicted for a higher fee.
+- A transfer with the same sender and nonce replaces a queued one only with a strictly higher fee.
+- On every tip change, mined and no longer valid transfers are dropped. (Transfers from blocks a
+  reorg removes are not re-queued in v0.2.)
+- Miners select by fee across senders, nonce order within a sender, re-checked against the exact
+  state they mine on.
+
 ## 9. P2P (libp2p)
 Networking uses go-libp2p (TCP and QUIC transports, Noise, yamux) and go-libp2p-pubsub. This is
 the justified third-party dependency of §1; nothing in `internal/consensus` depends on it. `<net>`
@@ -328,8 +338,12 @@ below is the network name from §2, so nodes of different networks never exchang
   The topic validator runs `AddBlock`: invalid → reject and ban the sender; unknown parent → ignore
   and sync from the sender; duplicate → ignore; otherwise accept (and forward). A node publishes
   every block it mines.
-- **Peers.** Ban (disconnect, refuse connections for 10 min) any peer that sends an invalid block or
-  undecodable block bytes via gossip or sync. Max 16 peers (connection manager, and inbound
+- **Transactions.** GossipSub topic `/canary/<net>/txs/1.0.0`; a message is one serialized
+  transfer. The validator adds it to the mempool: bad encoding or signature → reject and ban the
+  sender; state-dependent failures (nonce, balance, pool full) → ignore, since honest nodes can
+  briefly disagree about state; otherwise accept and forward.
+- **Peers.** Ban (disconnect, refuse connections for 10 min) any peer that sends an invalid block,
+  undecodable block bytes, or a badly encoded or badly signed transfer. Max 16 peers (connection manager, and inbound
   connections refused at the limit). Static `--peers` multiaddrs plus the addresses saved in
   `peers.json` at shutdown; static peers are redialled when the node has no connections. Liveness
   uses libp2p's built-in ping.
@@ -349,7 +363,9 @@ below is the network name from §2, so nodes of different networks never exchang
 ## 10. HTTP API (localhost only by default)
 | Method | Path | Returns |
 |---|---|---|
-| GET | `/tip` | `{height, hash, bits, time, cumulativeWork}` |
+| GET | `/tip` | `{height, hash, genesis, bits, time, cumulativeWork, mempool}` |
+| GET | `/account/{addr}` | `{address, balance, nonce, nextNonce}`; `nextNonce` counts mempool transfers |
+| POST | `/tx` | body = transfer hex; adds it to the mempool and relays it → `{id}` (`H2(tx)`) |
 | GET | `/block/{height or hash}` | block JSON (§11 format) |
 | GET | `/stats` | `{bits, epoch, blocksInEpoch, avgInterval, capacityOpsPerSec, secp256k1Distance}` where capacity = √(πn/4)/avgInterval averaged over current epoch, distance = 256 − bits |
 | GET | `/peers` | connected peers |
@@ -371,6 +387,9 @@ canary node    [--datadir DIR] [--listen MULTIADDR,...] [--api 127.0.0.1:18556]
               [--profile prototype|mainnet]
 canary mine    --chain FILE.json --miner-address ADDR [--blocks N] [--threads N]   # offline, like reference
 canary keygen  --out FILE                                                           # SLH-DSA key, prints address
+canary address --key FILE
+canary balance [--api URL] ADDR
+canary send    --key FILE --to ADDR --amount N [--fee N] [--api URL]                # sign + submit
 canary verify  FILE.json                                                             # prints cumulative work
 canary export  --datadir DIR FILE.json
 canary vectors [reference/test_vectors.json]                                         # conformance run
@@ -384,8 +403,10 @@ internal/consensus/   params.go hash.go prime.go curve.go h2c.go header.go block
 internal/miner/       curvesearch.go rho.go miner.go
 internal/chain/       index.go manager.go store.go
 internal/p2p/         wire.go gater.go identity.go node.go
-internal/node/        node.go   (chain + p2p + mining loop)
-internal/api/         server.go
+internal/node/        node.go   (chain + mempool + p2p + API + mining loop)
+internal/mempool/     pool.go
+internal/wallet/      key.go
+internal/api/         server.go client.go
 internal/chainjson/   format.go
 reference/            canary.py gen_vectors.py test_vectors.json   (do not modify)
 ```

@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"math/big"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/decanus/canary/internal/api"
 	"github.com/decanus/canary/internal/chain"
 	"github.com/decanus/canary/internal/chainjson"
 	"github.com/decanus/canary/internal/conformance"
@@ -31,13 +33,19 @@ commands:
   vectors [FILE]   run the conformance vectors (default reference/test_vectors.json)
   keygen --out FILE
                    create an SLH-DSA key, print its address
+  address --key FILE
+                   print a key's address
+  balance [--api URL] ADDR
+                   show an account's balance and nonce
+  send --key FILE --to ADDR --amount N [--fee N] [--api URL]
+                   sign a transfer (takes a few seconds) and submit it to a node
   verify FILE      validate a chain JSON file and print its cumulative work
   mine --chain FILE [--blocks N] [--threads N] [--miner-address STR] [--profile prototype|mainnet]
                    mine blocks onto a chain JSON file (created if missing), offline
   export --datadir DIR FILE
                    write a node's active chain as chain JSON (read-only)
-  node [--datadir DIR] [--listen ADDRS] [--peers ADDRS] [--mine] [--miner-address STR]
-       [--threads N] [--profile prototype|mainnet]
+  node [--datadir DIR] [--listen ADDRS] [--peers ADDRS] [--api HOST:PORT]
+       [--mine --miner-address ADDR] [--threads N] [--profile prototype|mainnet]
                    run a full node (libp2p networking, optional mining)
 `
 
@@ -56,6 +64,12 @@ func main() {
 		err = runMine(args)
 	case "keygen":
 		err = runKeygen(args)
+	case "address":
+		err = runAddress(args)
+	case "balance":
+		err = runBalance(args)
+	case "send":
+		err = runSend(args)
 	case "export":
 		err = runExport(args)
 	case "node":
@@ -232,6 +246,7 @@ func runNode(args []string) error {
 	datadir := fset.String("datadir", "", "data directory (default ~/.canary/<profile>)")
 	listen := fset.String("listen", "", "comma-separated listen multiaddrs (default TCP and QUIC on the profile's port)")
 	peers := fset.String("peers", "", "comma-separated peer multiaddrs ending in /p2p/<id>")
+	apiAddr := fset.String("api", "", "HTTP API listen address (default 127.0.0.1:<profile API port>; \"off\" disables)")
 	mine := fset.Bool("mine", false, "mine blocks")
 	minerHex := fset.String("miner-address", "", "address (hex) that receives rewards (required with --mine)")
 	threads := fset.Int("threads", runtime.NumCPU(), "rho worker goroutines")
@@ -263,6 +278,12 @@ func runNode(args []string) error {
 		}
 	}
 
+	switch *apiAddr {
+	case "":
+		*apiAddr = fmt.Sprintf("127.0.0.1:%d", p.APIPort)
+	case "off":
+		*apiAddr = ""
+	}
 	n, err := node.Open(node.Config{
 		DataDir:      *datadir,
 		Params:       p,
@@ -270,6 +291,7 @@ func runNode(args []string) error {
 		Mine:         *mine,
 		MinerAddress: minerAddr,
 		Threads:      *threads,
+		API:          *apiAddr,
 	})
 	if err != nil {
 		return err
@@ -278,6 +300,9 @@ func runNode(args []string) error {
 	fmt.Fprintf(os.Stderr, "canary %s node, datadir %s, %d blocks\n", p.Network, *datadir, n.Chain.Height())
 	for _, a := range n.P2P.Addrs() {
 		fmt.Fprintf(os.Stderr, "listening on %s\n", a)
+	}
+	if n.API != nil {
+		fmt.Fprintf(os.Stderr, "API on http://%s\n", n.API.Addr())
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -311,5 +336,96 @@ func runKeygen(args []string) error {
 	}
 	a := k.Address()
 	fmt.Printf("%x\n", a)
+	return nil
+}
+
+const defaultAPI = "http://127.0.0.1:18556"
+
+func runAddress(args []string) error {
+	fset := flag.NewFlagSet("address", flag.ExitOnError)
+	keyPath := fset.String("key", "", "key file (required)")
+	fset.Parse(args)
+	if *keyPath == "" {
+		return errors.New("usage: canary address --key FILE")
+	}
+	k, err := wallet.Load(*keyPath)
+	if err != nil {
+		return err
+	}
+	a := k.Address()
+	fmt.Printf("%x\n", a)
+	return nil
+}
+
+func runBalance(args []string) error {
+	fset := flag.NewFlagSet("balance", flag.ExitOnError)
+	apiURL := fset.String("api", defaultAPI, "node API URL")
+	fset.Parse(args)
+	if fset.NArg() != 1 {
+		return errors.New("usage: canary balance [--api URL] ADDR")
+	}
+	addr, err := wallet.ParseAddress(fset.Arg(0))
+	if err != nil {
+		return err
+	}
+	acc, err := api.NewClient(*apiURL).Account(addr)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("balance %s, nonce %d, next nonce %d\n", acc.Balance, acc.Nonce, acc.NextNonce)
+	return nil
+}
+
+func runSend(args []string) error {
+	fset := flag.NewFlagSet("send", flag.ExitOnError)
+	keyPath := fset.String("key", "", "sender key file (required)")
+	toHex := fset.String("to", "", "recipient address (required)")
+	amountStr := fset.String("amount", "", "amount in base units (required)")
+	feeStr := fset.String("fee", "0", "fee in base units, paid to the miner")
+	apiURL := fset.String("api", defaultAPI, "node API URL")
+	fset.Parse(args)
+	if *keyPath == "" || *toHex == "" || *amountStr == "" {
+		return errors.New("usage: canary send --key FILE --to ADDR --amount N [--fee N] [--api URL]")
+	}
+	k, err := wallet.Load(*keyPath)
+	if err != nil {
+		return err
+	}
+	to, err := wallet.ParseAddress(*toHex)
+	if err != nil {
+		return err
+	}
+	amount, ok1 := new(big.Int).SetString(*amountStr, 10)
+	fee, ok2 := new(big.Int).SetString(*feeStr, 10)
+	if !ok1 || !ok2 || amount.Sign() < 0 || fee.Sign() < 0 || amount.BitLen() > 128 || fee.BitLen() > 128 {
+		return errors.New("amount and fee must be non-negative integers below 2^128")
+	}
+
+	client := api.NewClient(*apiURL)
+	tip, err := client.Tip()
+	if err != nil {
+		return err
+	}
+	if tip.Genesis == "" {
+		return errors.New("the node has no chain yet")
+	}
+	genesis, err := wallet.ParseAddress(tip.Genesis)
+	if err != nil {
+		return err
+	}
+	acc, err := client.Account(k.Address())
+	if err != nil {
+		return err
+	}
+	tx := &consensus.Transfer{To: to, Amount: amount, Fee: fee, Nonce: acc.NextNonce}
+	fmt.Fprintf(os.Stderr, "signing transfer (nonce %d)...\n", tx.Nonce)
+	if err := k.SignTransfer(tx, genesis); err != nil {
+		return err
+	}
+	res, err := client.SubmitTx(tx)
+	if err != nil {
+		return err
+	}
+	fmt.Println(res.ID)
 	return nil
 }
