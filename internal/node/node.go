@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
+	"net/http"
 	"time"
 
+	"github.com/decanus/canary/internal/api"
 	"github.com/decanus/canary/internal/chain"
 	"github.com/decanus/canary/internal/consensus"
 	"github.com/decanus/canary/internal/miner"
@@ -18,6 +21,7 @@ type Config struct {
 	DataDir      string
 	Params       *consensus.Params
 	P2P          p2p.Config // DataDir, Now and Logf default to the node's
+	API          string     // HTTP API listen address (SPEC.md §10); empty disables the API
 	Mine         bool
 	MinerAddress string
 	Threads      int
@@ -31,6 +35,7 @@ type Node struct {
 	Chain *chain.Manager
 	P2P   *p2p.Node
 	cfg   Config
+	api   *http.Server // nil if the API is disabled
 }
 
 // Open opens the data directory and starts networking.
@@ -55,7 +60,37 @@ func Open(cfg Config) (*Node, error) {
 		cm.Close()
 		return nil, err
 	}
-	return &Node{Chain: cm, P2P: pn, cfg: cfg}, nil
+	n := &Node{Chain: cm, P2P: pn, cfg: cfg}
+	if cfg.API != "" {
+		// Listen now so that a bad or busy address fails Open rather than a background goroutine.
+		ln, err := net.Listen("tcp", cfg.API)
+		if err != nil {
+			return nil, errors.Join(err, pn.Close(), cm.Close())
+		}
+		// The timeouts bound every handler, so Close can wait for them before closing the chain.
+		// Addr is informational (Serve uses ln) and records the resolved port for APIAddr.
+		n.api = &http.Server{
+			Addr:              ln.Addr().String(),
+			Handler:           api.New(cm, pn, cfg.Now),
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+		}
+		go func() {
+			if err := n.api.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				cfg.Logf("api: %v", err)
+			}
+		}()
+	}
+	return n, nil
+}
+
+// APIAddr returns the HTTP API's listen address (host:port), or "" if the API is disabled.
+func (n *Node) APIAddr() string {
+	if n.api == nil {
+		return ""
+	}
+	return n.api.Addr
 }
 
 // Run mines (if enabled) until ctx is cancelled; otherwise it just waits, since networking runs
@@ -69,9 +104,14 @@ func (n *Node) Run(ctx context.Context) error {
 	return nil
 }
 
-// Close stops networking and closes the data directory.
+// Close stops the API and networking and closes the data directory.
 func (n *Node) Close() error {
-	return errors.Join(n.P2P.Close(), n.Chain.Close())
+	var err error
+	if n.api != nil {
+		// No deadline: a handler still running after a forced close could use the closed chain.
+		err = n.api.Shutdown(context.Background())
+	}
+	return errors.Join(err, n.P2P.Close(), n.Chain.Close())
 }
 
 // mine repeatedly mines on the current tip, abandoning a solve when the tip changes, and

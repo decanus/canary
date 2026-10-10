@@ -130,6 +130,10 @@ func New(cm *chain.Manager, cfg Config) (*Node, error) {
 			return string(sum[:])
 		}),
 		pubsub.WithMaxMessageSize(consensus.MaxBlockSize+64<<10),
+		// Send our own blocks straight to every topic peer (at most 16), not just the mesh, so a
+		// fresh block reaches everyone in one hop. The mesh also only takes in new peers at the
+		// next heartbeat, so a mesh-only publish could miss a peer that just joined.
+		pubsub.WithFloodPublish(true),
 	)
 	if err != nil {
 		return fail(err)
@@ -204,6 +208,9 @@ func (n *Node) Peers() []peer.AddrInfo {
 	}
 	return out
 }
+
+// TopicPeers returns the peers known to be subscribed to the block topic.
+func (n *Node) TopicPeers() []peer.ID { return n.topic.ListPeers() }
 
 // Connect dials a peer given as a multiaddr ending in /p2p/<id>.
 func (n *Node) Connect(ctx context.Context, addr string) error {

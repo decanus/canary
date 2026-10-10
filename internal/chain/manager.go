@@ -343,13 +343,21 @@ func (m *Manager) Height() int {
 
 // ActiveHeaders returns a snapshot of the active chain's headers, usable as a ChainView.
 func (m *Manager) ActiveHeaders() consensus.Headers {
+	_, hs := m.ActiveTail(math.MaxInt)
+	return hs
+}
+
+// ActiveTail returns the headers of the last (up to) n active blocks, read atomically, and the
+// height of the first one.
+func (m *Manager) ActiveTail(n int) (start int, headers consensus.Headers) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	hs := make(consensus.Headers, len(m.active))
-	for i, n := range m.active {
-		hs[i] = n.block.Header
+	start = max(len(m.active)-n, 0)
+	headers = make(consensus.Headers, len(m.active)-start)
+	for i, nd := range m.active[start:] {
+		headers[i] = nd.block.Header
 	}
-	return hs
+	return start, headers
 }
 
 // ActiveBlocks returns the active chain's blocks from genesis.

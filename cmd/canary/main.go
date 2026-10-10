@@ -33,9 +33,9 @@ commands:
                    mine blocks onto a chain JSON file (created if missing), offline
   export --datadir DIR FILE
                    write a node's active chain as chain JSON (read-only)
-  node [--datadir DIR] [--listen ADDRS] [--peers ADDRS] [--mine] [--miner-address STR]
-       [--threads N] [--profile prototype|mainnet]
-                   run a full node (libp2p networking, optional mining)
+  node [--datadir DIR] [--listen ADDRS] [--api ADDR|off] [--peers ADDRS] [--mine]
+       [--miner-address STR] [--threads N] [--profile prototype|mainnet]
+                   run a full node (libp2p networking, HTTP API, optional mining)
 `
 
 func main() {
@@ -218,6 +218,7 @@ func runNode(args []string) error {
 	datadir := fset.String("datadir", "", "data directory (default ~/.canary/<profile>)")
 	listen := fset.String("listen", "", "comma-separated listen multiaddrs (default TCP and QUIC on the profile's port)")
 	peers := fset.String("peers", "", "comma-separated peer multiaddrs ending in /p2p/<id>")
+	apiAddr := fset.String("api", "", `HTTP API address (default 127.0.0.1:<profile's API port>; "off" disables)`)
 	mine := fset.Bool("mine", false, "mine blocks")
 	minerAddr := fset.String("miner-address", "miner-address", "miner identity in the coinbase")
 	threads := fset.Int("threads", runtime.NumCPU(), "rho worker goroutines")
@@ -234,6 +235,12 @@ func runNode(args []string) error {
 		}
 		*datadir = filepath.Join(home, ".canary", p.Network)
 	}
+	switch *apiAddr {
+	case "":
+		*apiAddr = fmt.Sprintf("127.0.0.1:%d", p.APIPort)
+	case "off":
+		*apiAddr = ""
+	}
 	listenAddrs := splitList(*listen)
 	if len(listenAddrs) == 0 {
 		listenAddrs = []string{
@@ -246,6 +253,7 @@ func runNode(args []string) error {
 		DataDir:      *datadir,
 		Params:       p,
 		P2P:          p2p.Config{Listen: listenAddrs, Peers: splitList(*peers)},
+		API:          *apiAddr,
 		Mine:         *mine,
 		MinerAddress: *minerAddr,
 		Threads:      *threads,
@@ -257,6 +265,9 @@ func runNode(args []string) error {
 	fmt.Fprintf(os.Stderr, "canary %s node, datadir %s, %d blocks\n", p.Network, *datadir, n.Chain.Height())
 	for _, a := range n.P2P.Addrs() {
 		fmt.Fprintf(os.Stderr, "listening on %s\n", a)
+	}
+	if a := n.APIAddr(); a != "" {
+		fmt.Fprintf(os.Stderr, "HTTP API on http://%s\n", a)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
