@@ -25,6 +25,9 @@ const (
 	maxLocator = 32
 )
 
+// syncBatch is how many blocks handleSync returns at most; tests lower it.
+var syncBatch = MaxSyncBlocks
+
 // Protocol IDs and topic names are namespaced by network, so different networks never mix.
 func statusProtocol(network string) protocol.ID {
 	return protocol.ID("/canary/" + network + "/status/1.0.0")

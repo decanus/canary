@@ -9,6 +9,10 @@ import (
 // ErrInvalid is wrapped by every consensus rejection from ValidateBlock.
 var ErrInvalid = errors.New("invalid block")
 
+// ErrTooNew is the future-time rejection (rule 7). It wraps ErrInvalid, but unlike the other
+// rules it depends on the local clock, so a peer relaying such a block is not misbehaving.
+var ErrTooNew = fmt.Errorf("%w: time too far in future", ErrInvalid)
+
 func invalid(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, args...))
 }
@@ -80,7 +84,7 @@ func ValidateBlock(p *Params, chain ChainView, blk *Block, now *int64) error {
 	// 7. future limit (live blocks only).
 	// Written as a subtraction so that a huge now cannot overflow.
 	if now != nil && int64(h.Time)-p.FutureLimit > *now {
-		return invalid("time too far in future")
+		return ErrTooNew
 	}
 
 	// 8. curve and order.

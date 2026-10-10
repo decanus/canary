@@ -3,11 +3,13 @@ package p2p
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 const (
@@ -42,20 +44,31 @@ func loadIdentity(dir string) (crypto.PrivKey, error) {
 	return sk, os.WriteFile(path, data, 0o600)
 }
 
-// loadPeers reads the saved peer addresses; a missing file is empty.
-func loadPeers(dir string) ([]peer.AddrInfo, error) {
+// loadPeers reads the saved peer addresses, skipping (and returning) entries that do not parse;
+// a missing file is empty.
+func loadPeers(dir string) ([]peer.AddrInfo, []error, error) {
 	data, err := os.ReadFile(filepath.Join(dir, peersFile))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var addrs []string
 	if err := json.Unmarshal(data, &addrs); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return parsePeers(addrs)
+	var good []ma.Multiaddr
+	var bad []error
+	for _, s := range addrs {
+		if a, err := parseP2pAddr(s); err != nil {
+			bad = append(bad, err)
+		} else {
+			good = append(good, a)
+		}
+	}
+	infos, err := peer.AddrInfosFromP2pAddrs(good...)
+	return infos, bad, err
 }
 
 func savePeers(dir string, infos []peer.AddrInfo) error {
@@ -78,23 +91,24 @@ func savePeers(dir string, infos []peer.AddrInfo) error {
 
 // parsePeers parses multiaddrs ending in /p2p/<peer id>, merging addresses of the same peer.
 func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
-	byID := map[peer.ID]*peer.AddrInfo{}
-	var order []peer.ID
+	var mas []ma.Multiaddr
 	for _, s := range addrs {
-		info, err := peer.AddrInfoFromString(s)
+		a, err := parseP2pAddr(s)
 		if err != nil {
 			return nil, err
 		}
-		if cur, ok := byID[info.ID]; ok {
-			cur.Addrs = append(cur.Addrs, info.Addrs...)
-			continue
-		}
-		byID[info.ID] = info
-		order = append(order, info.ID)
+		mas = append(mas, a)
 	}
-	out := make([]peer.AddrInfo, len(order))
-	for i, id := range order {
-		out[i] = *byID[id]
+	return peer.AddrInfosFromP2pAddrs(mas...)
+}
+
+func parseP2pAddr(s string) (ma.Multiaddr, error) {
+	a, err := ma.NewMultiaddr(s)
+	if err != nil {
+		return nil, fmt.Errorf("%q: %w", s, err)
 	}
-	return out, nil
+	if _, err := peer.AddrInfoFromP2pAddr(a); err != nil {
+		return nil, fmt.Errorf("%q: %w", s, err)
+	}
+	return a, nil
 }

@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/control"
@@ -13,7 +14,8 @@ import (
 // gater refuses connections to and from banned peers, and inbound connections beyond maxPeers.
 type gater struct {
 	maxPeers int
-	peers    func() int // current connected peer count; set once the host exists
+	// net is set once the host exists; the host's goroutines read it concurrently.
+	net atomic.Pointer[network.Network]
 
 	mu     sync.Mutex
 	banned map[peer.ID]time.Time
@@ -48,7 +50,8 @@ func (g *gater) InterceptSecured(dir network.Direction, p peer.ID, _ network.Con
 	if g.isBanned(p) {
 		return false
 	}
-	return dir == network.DirOutbound || g.peers == nil || g.peers() < g.maxPeers
+	net := g.net.Load()
+	return dir == network.DirOutbound || net == nil || len((*net).Peers()) < g.maxPeers
 }
 
 func (g *gater) InterceptUpgraded(network.Conn) (bool, control.DisconnectReason) { return true, 0 }

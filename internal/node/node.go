@@ -86,8 +86,9 @@ func (n *Node) mine(ctx context.Context) {
 		}
 		headers := n.Chain.ActiveHeaders()
 		solveCtx, cancel := context.WithCancel(ctx)
-		done := make(chan struct{})
+		done, watcherExited := make(chan struct{}), make(chan struct{})
 		go func() {
+			defer close(watcherExited)
 			select {
 			case <-events:
 				cancel()
@@ -96,6 +97,8 @@ func (n *Node) mine(ctx context.Context) {
 		}()
 		res, err := miner.MineBlock(solveCtx, n.cfg.Params, headers, n.cfg.MinerAddress, n.cfg.Threads, n.cfg.Now())
 		close(done)
+		// Wait for the watcher so it cannot take a tip event meant for the next iteration.
+		<-watcherExited
 		cancel()
 		switch {
 		case ctx.Err() != nil:

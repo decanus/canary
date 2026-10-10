@@ -46,6 +46,11 @@ type Node struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// Every goroutine that touches the chain (our own, pubsub validators, stream handlers)
+	// registers in wg via enter, so Close can wait for all of them before the chain closes.
+	mu     sync.Mutex
+	closed bool
 	wg     sync.WaitGroup
 
 	syncMu  sync.Mutex
@@ -78,9 +83,12 @@ func New(cm *chain.Manager, cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("p2p: --peers: %w", err)
 	}
-	saved, err := loadPeers(cfg.DataDir)
+	saved, bad, err := loadPeers(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("p2p: %s: %w", peersFile, err)
+	}
+	for _, err := range bad {
+		cfg.Logf("p2p: %s: skipping %v", peersFile, err)
 	}
 	sk, err := loadIdentity(cfg.DataDir)
 	if err != nil {
@@ -101,7 +109,8 @@ func New(cm *chain.Manager, cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	g.peers = func() int { return len(h.Network().Peers()) }
+	hostNet := h.Network()
+	g.net.Store(&hostNet)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
@@ -142,22 +151,36 @@ func New(cm *chain.Manager, cfg Config) (*Node, error) {
 		ConnectedF: func(_ network.Network, c network.Conn) {
 			// The dialer starts the status exchange; the handler side answers it.
 			if c.Stat().Direction == network.DirOutbound {
-				n.goSafe(func() { n.exchangeStatus(c.RemotePeer()) })
+				n.spawn(func() { n.exchangeStatus(c.RemotePeer()) })
 			}
 		},
 	})
 
-	n.goSafe(n.drain)
-	n.goSafe(n.poll)
+	n.spawn(n.drain)
+	n.spawn(n.poll)
 	for _, info := range append(static, saved...) {
-		n.goSafe(func() { n.dial(info) })
+		n.spawn(func() { n.dial(info) })
 	}
 	return n, nil
 }
 
-// goSafe runs f in a goroutine tracked for Close.
-func (n *Node) goSafe(f func()) {
+// enter registers a unit of work for Close to wait on; it returns false once the node is
+// closing. Callers that get true must call n.wg.Done.
+func (n *Node) enter() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return false
+	}
 	n.wg.Add(1)
+	return true
+}
+
+// spawn runs f in a goroutine that Close waits for, unless the node is closing.
+func (n *Node) spawn(f func()) {
+	if !n.enter() {
+		return
+	}
 	go func() {
 		defer n.wg.Done()
 		f()
@@ -196,12 +219,16 @@ func (n *Node) Publish(blk *consensus.Block) error {
 	return n.topic.Publish(n.ctx, blk.Serialize())
 }
 
-// Close saves the connected peers to peers.json and shuts the node down.
+// Close saves the connected peers to peers.json and shuts the node down. When it returns, no
+// goroutine of the node is still using the chain manager.
 func (n *Node) Close() error {
 	var err error
 	if peers := n.Peers(); len(peers) > 0 {
 		err = savePeers(n.cfg.DataDir, peers)
 	}
+	n.mu.Lock()
+	n.closed = true
+	n.mu.Unlock()
 	n.cancel()
 	n.sub.Cancel()
 	err = errors.Join(err, n.host.Close())
@@ -239,19 +266,24 @@ func (n *Node) poll() {
 		}
 		peers := n.host.Network().Peers()
 		for _, p := range peers {
-			n.goSafe(func() { n.exchangeStatus(p) })
+			n.spawn(func() { n.exchangeStatus(p) })
 		}
 		if len(peers) == 0 {
 			for _, info := range n.static {
-				n.goSafe(func() { n.dial(info) })
+				n.spawn(func() { n.dial(info) })
 			}
 		}
 	}
 }
 
 // validate is the gossip topic validator: it adds the block to the chain. Invalid blocks are
-// rejected and their sender banned; orphans trigger a sync with the sender.
+// rejected and their sender banned; orphans trigger a sync with the sender. A block we already
+// validated (for example via sync) is accepted so that it is still relayed onward.
 func (n *Node) validate(_ context.Context, from peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
+	if !n.enter() {
+		return pubsub.ValidationIgnore
+	}
+	defer n.wg.Done()
 	if from == n.host.ID() {
 		// Published by us after AddBlock. (msg.Local is not yet set when validators run.)
 		return pubsub.ValidationAccept
@@ -263,6 +295,8 @@ func (n *Node) validate(_ context.Context, from peer.ID, msg *pubsub.Message) pu
 	}
 	st, err := n.chain.AddBlock(blk, n.cfg.Now())
 	switch {
+	case errors.Is(err, consensus.ErrTooNew):
+		return pubsub.ValidationIgnore // our clock may simply be behind the sender's
 	case errors.Is(err, consensus.ErrInvalid):
 		n.punish(from, err)
 		return pubsub.ValidationReject
@@ -270,10 +304,12 @@ func (n *Node) validate(_ context.Context, from peer.ID, msg *pubsub.Message) pu
 		n.cfg.Logf("p2p: adding gossiped block: %v", err)
 		return pubsub.ValidationIgnore
 	case st == chain.Orphan:
-		n.goSafe(func() { n.syncFrom(from) })
+		n.spawn(func() { n.syncFrom(from) })
 		return pubsub.ValidationIgnore
 	case st == chain.Duplicate:
-		return pubsub.ValidationIgnore
+		if _, _, err := n.chain.BlockByHash(blk.Hash()); err != nil {
+			return pubsub.ValidationIgnore // a still-unvalidated orphan
+		}
 	}
 	return pubsub.ValidationAccept
 }
@@ -311,6 +347,11 @@ func (n *Node) exchangeStatus(p peer.ID) {
 }
 
 func (n *Node) handleStatus(s network.Stream) {
+	if !n.enter() {
+		s.Reset()
+		return
+	}
+	defer n.wg.Done()
 	defer s.Close()
 	s.SetDeadline(time.Now().Add(30 * time.Second))
 	remote, err := readStatus(s)
@@ -330,12 +371,14 @@ func (n *Node) maybeSync(p peer.ID, remote Status) {
 		return
 	}
 	if _, _, work, _ := n.chain.Tip(); remote.Work.Cmp(work) > 0 {
-		n.goSafe(func() { n.syncFrom(p) })
+		n.spawn(func() { n.syncFrom(p) })
 	}
 }
 
-// syncFrom fetches blocks from p in batches until it has nothing new. At most one sync per peer
-// runs at a time.
+// syncFrom fetches p's active chain from where it diverges from ours until p has nothing more.
+// The first request carries our locator; each later one leads with the last block received, so
+// the cursor follows p's chain even through a long side branch whose blocks do not move our
+// tip. At most one sync per peer runs at a time.
 func (n *Node) syncFrom(p peer.ID) {
 	n.syncMu.Lock()
 	if n.syncing[p] {
@@ -350,8 +393,13 @@ func (n *Node) syncFrom(p peer.ID) {
 		n.syncMu.Unlock()
 	}()
 
+	var cursor *[32]byte
 	for n.ctx.Err() == nil {
-		blocks, err := n.requestBlocks(p)
+		locator := n.chain.Locator()
+		if cursor != nil {
+			locator = append([][32]byte{*cursor}, locator...)
+		}
+		blocks, err := n.requestBlocks(p, locator)
 		if errors.Is(err, consensus.ErrInvalid) {
 			n.punish(p, err)
 			return
@@ -359,33 +407,37 @@ func (n *Node) syncFrom(p peer.ID) {
 		if err != nil || len(blocks) == 0 {
 			return
 		}
-		progress := false
+		if cursor != nil && blocks[0].Header.PrevHash != *cursor {
+			return // p's chain changed under us (or p is misbehaving); the next poll retries
+		}
 		for _, blk := range blocks {
 			st, err := n.chain.AddBlock(blk, n.cfg.Now())
-			if errors.Is(err, consensus.ErrInvalid) {
+			switch {
+			case errors.Is(err, consensus.ErrTooNew):
+				return
+			case errors.Is(err, consensus.ErrInvalid):
 				n.punish(p, err)
 				return
-			}
-			if err != nil {
+			case err != nil:
 				n.cfg.Logf("p2p: adding synced block: %v", err)
 				return
+			case st == chain.Orphan:
+				return // not a continuation of anything we know
 			}
-			progress = progress || st != chain.Duplicate
 		}
-		if !progress || len(blocks) < MaxSyncBlocks {
-			return
-		}
+		last := blocks[len(blocks)-1].Hash()
+		cursor = &last
 	}
 }
 
-func (n *Node) requestBlocks(p peer.ID) ([]*consensus.Block, error) {
+func (n *Node) requestBlocks(p peer.ID, locator [][32]byte) ([]*consensus.Block, error) {
 	s, err := n.host.NewStream(n.ctx, p, syncProtocol(n.chain.Params().Network))
 	if err != nil {
 		return nil, err
 	}
 	defer s.Close()
 	s.SetDeadline(time.Now().Add(60 * time.Second))
-	if err := writeLocator(s, n.chain.Locator()); err != nil {
+	if err := writeLocator(s, locator); err != nil {
 		s.Reset()
 		return nil, err
 	}
@@ -403,6 +455,11 @@ func (n *Node) requestBlocks(p peer.ID) ([]*consensus.Block, error) {
 // handleSync answers a locator with the active blocks after the first locator hash on our
 // active chain (from genesis if none), bounded by count and size.
 func (n *Node) handleSync(s network.Stream) {
+	if !n.enter() {
+		s.Reset()
+		return
+	}
+	defer n.wg.Done()
 	defer s.Close()
 	s.SetDeadline(time.Now().Add(60 * time.Second))
 	locator, err := readLocator(s)
@@ -417,7 +474,7 @@ func (n *Node) handleSync(s network.Stream) {
 			break
 		}
 	}
-	blocks := n.chain.BlocksFrom(start, MaxSyncBlocks)
+	blocks := n.chain.BlocksFrom(start, syncBatch)
 	size := 0
 	for i, b := range blocks {
 		if size += b.SerializedSize(); size > maxSyncBytes {
