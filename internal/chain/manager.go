@@ -437,3 +437,27 @@ func (m *Manager) Locator() [][32]byte {
 	}
 	return out
 }
+
+// TipBlock returns the active tip block with its height and cumulative work, read atomically;
+// ok is false for an empty chain.
+func (m *Manager) TipBlock() (blk *consensus.Block, height int, work *big.Int, ok bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	t := m.tip()
+	if t == nil {
+		return nil, -1, new(big.Int), false
+	}
+	return t.block, t.height, new(big.Int).Set(t.work), true
+}
+
+// ActiveTail returns the headers of the last (up to) n active blocks, read atomically, and the
+// height of the first one.
+func (m *Manager) ActiveTail(n int) (start int, headers []*consensus.Header) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	start = max(len(m.active)-n, 0)
+	for _, nd := range m.active[start:] {
+		headers = append(headers, nd.block.Header)
+	}
+	return start, headers
+}

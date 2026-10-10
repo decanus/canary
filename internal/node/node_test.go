@@ -2,8 +2,12 @@ package node
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"math/big"
+	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +15,7 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"github.com/decanus/canary/internal/api"
 	"github.com/decanus/canary/internal/consensus"
 	"github.com/decanus/canary/internal/miner"
 	"github.com/decanus/canary/internal/p2p"
@@ -35,6 +40,7 @@ func start(t *testing.T, p *consensus.Params, mine bool, peers ...*Node) *Node {
 		DataDir:      t.TempDir(),
 		Params:       p,
 		P2P:          p2p.Config{Listen: []string{"/ip4/127.0.0.1/tcp/0"}, Peers: addrs, PollEvery: time.Hour},
+		API:          "127.0.0.1:0",
 		Mine:         mine,
 		MinerAddress: "test-miner",
 		Threads:      2,
@@ -166,5 +172,57 @@ func TestPeerSendingInvalidBlockIsBanned(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if connected() {
 		t.Fatal("banned peer reconnected")
+	}
+}
+
+// getJSON fetches path from n's HTTP API into out.
+func getJSON(t *testing.T, n *Node, path string, out any) {
+	t.Helper()
+	resp, err := http.Get("http://" + n.APIAddr().String() + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s: %s", path, resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubmitBlockOverAPIIsRelayed(t *testing.T) {
+	p := testParams()
+	a := start(t, p, false)
+	b := start(t, p, false, a)
+	// Status polling is off, so the block can only reach b by gossip: wait for b's subscription.
+	eventually(t, 10*time.Second, "a and b to see each other on the topic", func() bool {
+		return slices.Contains(a.P2P.TopicPeers(), b.P2P.ID()) && slices.Contains(b.P2P.TopicPeers(), a.P2P.ID())
+	})
+
+	res, err := miner.MineBlock(context.Background(), p, consensus.Headers{}, "api", 2, time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := hex.EncodeToString(res.Block.Serialize())
+	resp, err := http.Post("http://"+a.APIAddr().String()+"/submitblock", "text/plain", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("submitblock: %s", resp.Status)
+	}
+	eventually(t, 15*time.Second, "b to receive the submitted block", func() bool { return b.Chain.Height() == 1 })
+
+	var tip api.Tip
+	getJSON(t, b, "/tip", &tip)
+	if h := res.Block.Hash(); tip.Height != 0 || tip.Hash != hex.EncodeToString(h[:]) {
+		t.Fatalf("b's tip %+v", tip)
+	}
+	var peers []api.PeerInfo
+	getJSON(t, a, "/peers", &peers)
+	if len(peers) != 1 || peers[0].ID != b.P2P.ID().String() {
+		t.Fatalf("a's peers %+v", peers)
 	}
 }
