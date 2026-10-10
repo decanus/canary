@@ -128,7 +128,9 @@ func TestPeerSendingInvalidBlockIsBanned(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer h.Close()
-	ps, err := pubsub.NewGossipSub(context.Background(), h)
+	// Flood publish, like our nodes: otherwise a publish before the next heartbeat grafts a
+	// into the attacker's mesh goes nowhere.
+	ps, err := pubsub.NewGossipSub(context.Background(), h, pubsub.WithFloodPublish(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,22 +155,19 @@ func TestPeerSendingInvalidBlockIsBanned(t *testing.T) {
 		return slices.Contains(topic.ListPeers(), a.P2P.ID())
 	})
 
-	// A publish sent right after the subscription handshake can be dropped by the attacker's
-	// own gossip router, so keep publishing until a reacts.
-	eventually(t, 15*time.Second, "a to drop the attacker", func() bool {
-		if !connected() {
-			return true
-		}
-		topic.Publish(context.Background(), badBlock.Serialize())
-		time.Sleep(250 * time.Millisecond)
-		return false
-	})
+	if err := topic.Publish(context.Background(), badBlock.Serialize()); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 15*time.Second, "a to drop the attacker", func() bool { return !connected() })
 	if a.Chain.Has(badBlock.Hash()) {
 		t.Fatal("invalid block was stored")
 	}
 
-	// The ban holds: a refuses the attacker's reconnection.
-	h.Connect(context.Background(), *info)
+	// The ban holds: a refuses the attacker's reconnection. (A refused dial can otherwise hang
+	// until libp2p's 5 s timeout.)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	h.Connect(ctx, *info)
 	time.Sleep(500 * time.Millisecond)
 	if connected() {
 		t.Fatal("banned peer reconnected")
@@ -178,7 +177,7 @@ func TestPeerSendingInvalidBlockIsBanned(t *testing.T) {
 // getJSON fetches path from n's HTTP API into out.
 func getJSON(t *testing.T, n *Node, path string, out any) {
 	t.Helper()
-	resp, err := http.Get("http://" + n.APIAddr().String() + path)
+	resp, err := http.Get("http://" + n.APIAddr() + path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +204,7 @@ func TestSubmitBlockOverAPIIsRelayed(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := hex.EncodeToString(res.Block.Serialize())
-	resp, err := http.Post("http://"+a.APIAddr().String()+"/submitblock", "text/plain", strings.NewReader(body))
+	resp, err := http.Post("http://"+a.APIAddr()+"/submitblock", "text/plain", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

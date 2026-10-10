@@ -343,13 +343,21 @@ func (m *Manager) Height() int {
 
 // ActiveHeaders returns a snapshot of the active chain's headers, usable as a ChainView.
 func (m *Manager) ActiveHeaders() consensus.Headers {
+	_, hs := m.ActiveTail(math.MaxInt)
+	return hs
+}
+
+// ActiveTail returns the headers of the last (up to) n active blocks, read atomically, and the
+// height of the first one.
+func (m *Manager) ActiveTail(n int) (start int, headers consensus.Headers) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	hs := make(consensus.Headers, len(m.active))
-	for i, n := range m.active {
-		hs[i] = n.block.Header
+	start = max(len(m.active)-n, 0)
+	headers = make(consensus.Headers, len(m.active)-start)
+	for i, nd := range m.active[start:] {
+		headers[i] = nd.block.Header
 	}
-	return hs
+	return start, headers
 }
 
 // ActiveBlocks returns the active chain's blocks from genesis.
@@ -436,28 +444,4 @@ func (m *Manager) Locator() [][32]byte {
 		out = append(out, m.active[0].hash)
 	}
 	return out
-}
-
-// TipBlock returns the active tip block with its height and cumulative work, read atomically;
-// ok is false for an empty chain.
-func (m *Manager) TipBlock() (blk *consensus.Block, height int, work *big.Int, ok bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	t := m.tip()
-	if t == nil {
-		return nil, -1, new(big.Int), false
-	}
-	return t.block, t.height, new(big.Int).Set(t.work), true
-}
-
-// ActiveTail returns the headers of the last (up to) n active blocks, read atomically, and the
-// height of the first one.
-func (m *Manager) ActiveTail(n int) (start int, headers []*consensus.Header) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	start = max(len(m.active)-n, 0)
-	for _, nd := range m.active[start:] {
-		headers = append(headers, nd.block.Header)
-	}
-	return start, headers
 }

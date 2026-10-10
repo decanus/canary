@@ -50,12 +50,12 @@ func newManager(t *testing.T, p *consensus.Params, blocks []*consensus.Block) *c
 	return cm
 }
 
-type fakeNet struct{ published []*consensus.Block }
-
-func (f *fakeNet) Peers() []peer.AddrInfo {
-	id, _ := peer.Decode("12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA")
-	return []peer.AddrInfo{{ID: id, Addrs: []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/18555")}}}
+type fakeNet struct {
+	peers     []peer.AddrInfo
+	published []*consensus.Block
 }
+
+func (f *fakeNet) Peers() []peer.AddrInfo { return f.peers }
 
 func (f *fakeNet) Publish(blk *consensus.Block) error {
 	f.published = append(f.published, blk)
@@ -80,10 +80,10 @@ func do(t *testing.T, s http.Handler, method, path, body string, wantCode int, o
 }
 
 // TestStatsOnVectorChain recomputes the stats of the vector chain's last epoch from the informational
-// JSON fields, independently of ComputeStats.
+// JSON fields, independently of computeStats.
 func TestStatsOnVectorChain(t *testing.T) {
 	v, blocks := loadVectors(t)
-	s := New(newManager(t, &v.Params, blocks), nil, nil)
+	s := New(newManager(t, &v.Params, blocks), &fakeNet{}, nil)
 	var got Stats
 	do(t, s, "GET", "/stats", "", http.StatusOK, &got)
 
@@ -107,8 +107,8 @@ func TestStatsOnVectorChain(t *testing.T) {
 		CapacityOpsPerSec: sum / 6 / wantAvg,
 		Secp256k1Distance: 216,
 	}
-	if got.AvgInterval <= 0 {
-		t.Fatalf("avgInterval %v", got.AvgInterval)
+	if wantAvg <= 0 {
+		t.Fatalf("vector chain has non-increasing times: avg interval %v", wantAvg)
 	}
 	if math.Abs(got.CapacityOpsPerSec-want.CapacityOpsPerSec) > 1e-9*want.CapacityOpsPerSec {
 		t.Fatalf("capacity %v, want %v", got.CapacityOpsPerSec, want.CapacityOpsPerSec)
@@ -116,11 +116,6 @@ func TestStatsOnVectorChain(t *testing.T) {
 	got.CapacityOpsPerSec = want.CapacityOpsPerSec
 	if got != want {
 		t.Fatalf("stats\n got %+v\nwant %+v", got, want)
-	}
-	// 40-bit n lies in [2^39, 2^40), which bounds the per-block rho cost.
-	lo, hi := math.Sqrt(math.Pi*math.Exp2(39)/4)/wantAvg, math.Sqrt(math.Pi*math.Exp2(40)/4)/wantAvg
-	if got.CapacityOpsPerSec < lo || got.CapacityOpsPerSec >= hi {
-		t.Fatalf("capacity %v outside [%v, %v)", got.CapacityOpsPerSec, lo, hi)
 	}
 }
 
@@ -131,35 +126,49 @@ func TestComputeStatsEpochZero(t *testing.T) {
 		headers[i] = b.Header
 	}
 
-	st := ComputeStats(&v.Params, 0, headers[:1])
+	st := computeStats(&v.Params, 0, headers[:1])
 	if st != (Stats{Bits: 36, Epoch: 0, BlocksInEpoch: 1, Secp256k1Distance: 220}) {
 		t.Fatalf("genesis-only stats %+v", st)
 	}
 
-	st = ComputeStats(&v.Params, 0, headers[:10])
+	// Genesis has no interval, so neither the interval nor the capacity mean includes it.
+	st = computeStats(&v.Params, 0, headers[:10])
 	wantAvg := float64(int64(headers[9].Time)-int64(headers[0].Time)) / 9
-	if st.Epoch != 0 || st.BlocksInEpoch != 10 || st.AvgInterval != wantAvg || st.Bits != 36 {
-		t.Fatalf("stats at height 9: %+v (want avg %v)", st, wantAvg)
+	var sum float64
+	for _, h := range headers[1:10] {
+		n, _ := new(big.Float).SetInt(h.N).Float64()
+		sum += math.Sqrt(math.Pi * n / 4)
+	}
+	if st.Epoch != 0 || st.BlocksInEpoch != 10 || st.AvgInterval != wantAvg || st.Bits != 36 ||
+		math.Abs(st.CapacityOpsPerSec-sum/9/wantAvg) > 1e-9*st.CapacityOpsPerSec {
+		t.Fatalf("stats at height 9: %+v (want avg %v, capacity %v)", st, wantAvg, sum/9/wantAvg)
 	}
 
 	// The last block of epoch 0 counts all 64 blocks.
-	if st = ComputeStats(&v.Params, 0, headers[:64]); st.BlocksInEpoch != 64 {
+	if st = computeStats(&v.Params, 0, headers[:64]); st.BlocksInEpoch != 64 {
 		t.Fatalf("stats at height 63: %+v", st)
 	}
 	// For the tip at 69, the tail from height 63 (as /stats reads it) is enough.
-	full, tail := ComputeStats(&v.Params, 0, headers), ComputeStats(&v.Params, 63, headers[63:])
+	full, tail := computeStats(&v.Params, 0, headers), computeStats(&v.Params, 63, headers[63:])
 	if full != tail {
 		t.Fatalf("stats from full chain %+v, from tail %+v", full, tail)
 	}
 }
 
-func TestTipBlockAndPeers(t *testing.T) {
+func TestReadEndpoints(t *testing.T) {
 	v, blocks := loadVectors(t)
-	empty := New(newManager(t, &v.Params, nil), nil, nil)
+	empty := New(newManager(t, &v.Params, nil), &fakeNet{}, nil)
 	do(t, empty, "GET", "/tip", "", http.StatusNotFound, nil)
 	do(t, empty, "GET", "/stats", "", http.StatusNotFound, nil)
+	var none []PeerInfo
+	do(t, empty, "GET", "/peers", "", http.StatusOK, &none)
+	if none == nil || len(none) != 0 {
+		t.Fatalf("peers with none connected: %#v", none)
+	}
 
-	s := New(newManager(t, &v.Params, blocks), &fakeNet{}, nil)
+	id, _ := peer.Decode("12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA")
+	net := &fakeNet{peers: []peer.AddrInfo{{ID: id, Addrs: []ma.Multiaddr{ma.StringCast("/ip4/127.0.0.1/tcp/18555")}}}}
+	s := New(newManager(t, &v.Params, blocks), net, nil)
 	var tip Tip
 	do(t, s, "GET", "/tip", "", http.StatusOK, &tip)
 	last := v.Chain.Blocks[69]
@@ -181,13 +190,17 @@ func TestTipBlockAndPeers(t *testing.T) {
 
 	var peers []PeerInfo
 	do(t, s, "GET", "/peers", "", http.StatusOK, &peers)
-	if len(peers) != 1 || peers[0].Addrs[0] != "/ip4/127.0.0.1/tcp/18555" {
+	if len(peers) != 1 || peers[0].ID != id.String() || peers[0].Addrs[0] != "/ip4/127.0.0.1/tcp/18555" {
 		t.Fatalf("peers %+v", peers)
 	}
-	var none []PeerInfo
-	do(t, New(newManager(t, &v.Params, nil), nil, nil), "GET", "/peers", "", http.StatusOK, &none)
-	if none == nil || len(none) != 0 {
-		t.Fatalf("peers without network: %#v", none)
+
+	// Browser cross-origin requests are refused.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/tip", nil)
+	req.Header.Set("Origin", "https://example.com")
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin request: status %d", rec.Code)
 	}
 }
 
@@ -207,13 +220,15 @@ func TestSubmitBlock(t *testing.T) {
 
 	// An orphan is kept but not relayed; its parent connects both and is relayed.
 	submit(blocks[69], http.StatusOK, "orphan")
+	submit(blocks[69], http.StatusOK, "duplicate") // still an orphan: not relayed
 	submit(blocks[68], http.StatusOK, "new-tip")
 	if h, _, _, _ := cm.Tip(); h != blocks[69].Hash() {
 		t.Fatal("orphan was not connected")
 	}
+	// Resubmitting a connected block relays it again, so a failed relay can be retried.
 	submit(blocks[68], http.StatusOK, "duplicate")
-	if len(net.published) != 1 || net.published[0].Hash() != blocks[68].Hash() {
-		t.Fatalf("published %d blocks, want only block 68", len(net.published))
+	if len(net.published) != 2 || net.published[0].Hash() != blocks[68].Hash() || net.published[1].Hash() != blocks[68].Hash() {
+		t.Fatalf("published %d blocks, want block 68 twice", len(net.published))
 	}
 
 	bad := *blocks[69].Header
@@ -222,7 +237,7 @@ func TestSubmitBlock(t *testing.T) {
 	do(t, s, "POST", "/submitblock", "not hex", http.StatusBadRequest, nil)
 	do(t, s, "POST", "/submitblock", "00", http.StatusBadRequest, nil)
 	do(t, s, "POST", "/submitblock", strings.Repeat("0", 2*consensus.MaxBlockSize+2048), http.StatusRequestEntityTooLarge, nil)
-	if len(net.published) != 1 {
+	if len(net.published) != 2 {
 		t.Fatal("rejected block was relayed")
 	}
 }

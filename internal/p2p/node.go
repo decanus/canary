@@ -130,9 +130,9 @@ func New(cm *chain.Manager, cfg Config) (*Node, error) {
 			return string(sum[:])
 		}),
 		pubsub.WithMaxMessageSize(consensus.MaxBlockSize+64<<10),
-		// Send our own blocks to every topic peer, not just the mesh: the mesh only takes in new
-		// peers at the next heartbeat, so a block published right after a peer joins would
-		// otherwise reach it only via the next status poll.
+		// Send our own blocks straight to every topic peer (at most 16), not just the mesh, so a
+		// fresh block reaches everyone in one hop. The mesh also only takes in new peers at the
+		// next heartbeat, so a mesh-only publish could miss a peer that just joined.
 		pubsub.WithFloodPublish(true),
 	)
 	if err != nil {

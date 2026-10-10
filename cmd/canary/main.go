@@ -266,7 +266,7 @@ func runNode(args []string) error {
 	for _, a := range n.P2P.Addrs() {
 		fmt.Fprintf(os.Stderr, "listening on %s\n", a)
 	}
-	if a := n.APIAddr(); a != nil {
+	if a := n.APIAddr(); a != "" {
 		fmt.Fprintf(os.Stderr, "HTTP API on http://%s\n", a)
 	}
 

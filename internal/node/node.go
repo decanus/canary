@@ -35,8 +35,7 @@ type Node struct {
 	Chain *chain.Manager
 	P2P   *p2p.Node
 	cfg   Config
-	api   *http.Server
-	apiLn net.Listener
+	api   *http.Server // nil if the API is disabled
 }
 
 // Open opens the data directory and starts networking.
@@ -64,12 +63,21 @@ func Open(cfg Config) (*Node, error) {
 	n := &Node{Chain: cm, P2P: pn, cfg: cfg}
 	if cfg.API != "" {
 		// Listen now so that a bad or busy address fails Open rather than a background goroutine.
-		if n.apiLn, err = net.Listen("tcp", cfg.API); err != nil {
+		ln, err := net.Listen("tcp", cfg.API)
+		if err != nil {
 			return nil, errors.Join(err, pn.Close(), cm.Close())
 		}
-		n.api = &http.Server{Handler: api.New(cm, pn, cfg.Now), ReadHeaderTimeout: 10 * time.Second}
+		// The timeouts bound every handler, so Close can wait for them before closing the chain.
+		// Addr is informational (Serve uses ln) and records the resolved port for APIAddr.
+		n.api = &http.Server{
+			Addr:              ln.Addr().String(),
+			Handler:           api.New(cm, pn, cfg.Now),
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+		}
 		go func() {
-			if err := n.api.Serve(n.apiLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := n.api.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				cfg.Logf("api: %v", err)
 			}
 		}()
@@ -77,12 +85,12 @@ func Open(cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// APIAddr returns the HTTP API's listen address, or nil if the API is disabled.
-func (n *Node) APIAddr() net.Addr {
-	if n.apiLn == nil {
-		return nil
+// APIAddr returns the HTTP API's listen address (host:port), or "" if the API is disabled.
+func (n *Node) APIAddr() string {
+	if n.api == nil {
+		return ""
 	}
-	return n.apiLn.Addr()
+	return n.api.Addr
 }
 
 // Run mines (if enabled) until ctx is cancelled; otherwise it just waits, since networking runs
@@ -100,9 +108,8 @@ func (n *Node) Run(ctx context.Context) error {
 func (n *Node) Close() error {
 	var err error
 	if n.api != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err = n.api.Shutdown(ctx)
-		cancel()
+		// No deadline: a handler still running after a forced close could use the closed chain.
+		err = n.api.Shutdown(context.Background())
 	}
 	return errors.Join(err, n.P2P.Close(), n.Chain.Close())
 }
