@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"slices"
 	"sync"
 
 	"github.com/decanus/canary/internal/consensus"
@@ -48,8 +49,10 @@ type TipEvent struct {
 	Height int
 	Header *consensus.Header
 	Work   *big.Int // cumulative work
-	// Reorg is the number of previously active blocks that left the active chain.
-	Reorg int
+	// Reorg is the number of previously active blocks that left the active chain, and Removed
+	// those blocks, oldest first (so their transfers can return to the mempool).
+	Reorg   int
+	Removed []*consensus.Block
 }
 
 // Manager owns the block tree, the active chain and the block store.
@@ -299,13 +302,12 @@ func (m *Manager) removeOrphan(hash [32]byte) {
 // a slow subscriber sees the newest tip rather than blocking the manager.
 func (m *Manager) notify(oldTip *node) {
 	tip := m.tip()
-	reorg := 0
-	if oldTip != nil {
-		for c := oldTip; c != nil && !onActive(m.active, c); c = c.parent {
-			reorg++
-		}
+	var removed []*consensus.Block
+	for c := oldTip; c != nil && !onActive(m.active, c); c = c.parent {
+		removed = append(removed, c.block)
 	}
-	ev := TipEvent{Hash: tip.hash, Height: tip.height, Header: tip.block.Header, Work: new(big.Int).Set(tip.work), Reorg: reorg}
+	slices.Reverse(removed)
+	ev := TipEvent{Hash: tip.hash, Height: tip.height, Header: tip.block.Header, Work: new(big.Int).Set(tip.work), Reorg: len(removed), Removed: removed}
 	for _, ch := range m.subs {
 		select {
 		case <-ch:
@@ -344,17 +346,6 @@ func (m *Manager) Height() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.active)
-}
-
-// ActiveHeaders returns a snapshot of the active chain's headers, usable as a ChainView.
-func (m *Manager) ActiveHeaders() consensus.Headers {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	hs := make(consensus.Headers, len(m.active))
-	for i, n := range m.active {
-		hs[i] = n.block.Header
-	}
-	return hs
 }
 
 // ActiveBlocks returns the active chain's blocks from genesis.
@@ -460,16 +451,6 @@ func (m *Manager) Account(addr consensus.Address) consensus.Account {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.state.Get(addr)
-}
-
-// GenesisHash returns the active chain's genesis block hash; ok is false for an empty chain.
-func (m *Manager) GenesisHash() (hash [32]byte, ok bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if len(m.active) == 0 {
-		return hash, false
-	}
-	return m.active[0].hash, true
 }
 
 // TipState returns the active chain's genesis hash and the state after its tip; ok is false for

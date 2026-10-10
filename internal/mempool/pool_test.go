@@ -61,7 +61,7 @@ func TestPool(t *testing.T) {
 		{alice, 1, 10, 20, false}, // 7: replaces a1 with a higher fee
 	})
 	p := New()
-	p.Update(genesis, st)
+	p.Update(genesis, st, nil)
 
 	mustAdd := func(i int) {
 		t.Helper()
@@ -115,13 +115,61 @@ func TestPool(t *testing.T) {
 	if sel := p.Select(after, 1<<20); len(sel) != 1 || sel[0] != txs[7] {
 		t.Fatalf("select on newer state: got %d transfers", len(sel))
 	}
-	p.Update(genesis, after)
-	if p.Len() != 1 || p.Pending(alice.Address()) != 1 || p.Pending(bob.Address()) != 0 {
+	p.Update(genesis, after, nil)
+	if p.Len() != 1 || p.NextNonce(alice.Address(), 1) != 2 || p.NextNonce(bob.Address(), 6) != 6 {
 		t.Fatalf("after update: len %d", p.Len())
 	}
 	// A different chain clears the pool.
-	p.Update([32]byte{1}, after)
+	p.Update([32]byte{1}, after, nil)
 	if p.Len() != 0 {
 		t.Fatal("pool kept transfers across chains")
+	}
+}
+
+func TestPoolNonceEdgesAndReorg(t *testing.T) {
+	alice, _ := wallet.Generate()
+	st := consensus.State{}
+	st.Set(alice.Address(), consensus.Account{Balance: big.NewInt(100)})
+	txs := signAll(t, []spec{
+		{alice, 1 << 63, 1, 1, false},   // 0: nonce that used to wrap the signed index
+		{alice, 0, 10, 1, false},        // 1: a0
+		{alice, 1, 10, 1, false},        // 2: a1
+		{alice, ^uint64(0), 1, 1, true}, // 3: max nonce, bad signature
+	})
+	p := New()
+	p.Update(genesis, st, nil)
+	for _, i := range []int{0, 3} {
+		if err := p.Add(txs[i]); err == nil {
+			t.Fatalf("tx %d accepted", i)
+		}
+	}
+	if err := p.Add(txs[1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Add(txs[2]); err != nil {
+		t.Fatal(err)
+	}
+
+	// A block mines a0; the chain moves before the pool does. NextNonce must not over-count.
+	cb := &consensus.Coinbase{To: consensus.Address{1}, Amount: big.NewInt(1)}
+	after, _, err := consensus.ApplyBlock(st, cb, []*consensus.Transfer{txs[1]}, big.NewInt(0), genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.NextNonce(alice.Address(), after.Get(alice.Address()).Nonce); got != 2 {
+		t.Fatalf("NextNonce before update = %d, want 2", got)
+	}
+	p.Update(genesis, after, nil)
+	if p.Len() != 1 {
+		t.Fatalf("after mining a0: len %d, want 1", p.Len())
+	}
+
+	// That block is reorged out: a0 returns, and a1 (queued behind it) survives.
+	p.Update(genesis, st, []*consensus.Transfer{txs[1]})
+	if p.Len() != 2 || p.NextNonce(alice.Address(), 0) != 2 {
+		t.Fatalf("after reorg: len %d, want 2", p.Len())
+	}
+	if sel := p.Select(st, 1<<20); len(sel) != 2 || sel[0] != txs[1] || sel[1] != txs[2] {
+		t.Fatal("reorged transfers not selectable in nonce order")
 	}
 }

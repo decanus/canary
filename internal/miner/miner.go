@@ -12,6 +12,7 @@ import (
 // Result describes a mined block.
 type Result struct {
 	Block     *consensus.Block
+	State     consensus.State // account state after Block
 	CurveCtr  uint32
 	CurveTime time.Duration
 	RhoTime   time.Duration
@@ -80,7 +81,7 @@ func MineBlock(ctx context.Context, p *consensus.Params, chain consensus.ChainVi
 	if _, _, err := consensus.ValidateBlock(p, chain, parent, blk, &now); err != nil {
 		return nil, fmt.Errorf("mined block failed validation: %w", err)
 	}
-	return &Result{Block: blk, CurveCtr: ctr, CurveTime: t1.Sub(t0), RhoTime: time.Since(t1), Rho: stats}, nil
+	return &Result{Block: blk, State: st, CurveCtr: ctr, CurveTime: t1.Sub(t0), RhoTime: time.Since(t1), Rho: stats}, nil
 }
 
 // timestamp returns the block time to use: now, raised to satisfy the median-time-past and

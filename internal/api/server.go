@@ -74,7 +74,7 @@ func (b Backend) tip(w http.ResponseWriter, _ *http.Request) {
 	t := Tip{Height: height, CumulativeWork: work.String(), Mempool: b.Pool.Len()}
 	if ok {
 		blk, _, _ := b.Chain.BlockByHash(hash)
-		genesis, _ := b.Chain.GenesisHash()
+		genesis, _, _ := b.Chain.TipState()
 		t.Hash, t.Genesis = hex.EncodeToString(hash[:]), hex.EncodeToString(genesis[:])
 		t.Bits, t.Time = blk.Header.Bits, blk.Header.Time
 	}
@@ -101,7 +101,7 @@ func (b Backend) account(w http.ResponseWriter, r *http.Request) {
 		Address:   hex.EncodeToString(addr[:]),
 		Balance:   acc.Balance.String(),
 		Nonce:     acc.Nonce,
-		NextNonce: acc.Nonce + uint64(b.Pool.Pending(addr)),
+		NextNonce: b.Pool.NextNonce(addr, acc.Nonce),
 	})
 }
 

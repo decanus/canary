@@ -58,8 +58,10 @@ func Open(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	pool := mempool.New()
+	// Subscribe before the first update so no tip change in between is missed.
+	events := cm.Subscribe()
 	if genesis, st, ok := cm.TipState(); ok {
-		pool.Update(genesis, st)
+		pool.Update(genesis, st, nil)
 	}
 	pc := cfg.P2P
 	pc.DataDir, pc.Now, pc.Logf, pc.Pool = cfg.DataDir, cfg.Now, cfg.Logf, pool
@@ -78,21 +80,32 @@ func Open(cfg Config) (*Node, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
-	go n.followTip(ctx)
+	go n.followTip(ctx, events)
 	return n, nil
 }
 
-// followTip keeps the mempool in step with the chain.
-func (n *Node) followTip(ctx context.Context) {
+// followTip keeps the mempool in step with the chain, returning transfers from blocks a reorg
+// removed. (Events are latest-wins, so back-to-back reorgs can still lose some; wallets can
+// resubmit.)
+func (n *Node) followTip(ctx context.Context, events <-chan chain.TipEvent) {
 	defer close(n.done)
-	events := n.Chain.Subscribe()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-events:
+		case ev := <-events:
+			var readd []*consensus.Transfer
+			for _, blk := range ev.Removed {
+				for _, raw := range blk.Txs {
+					if t, err := consensus.DecodeTx(raw); err == nil {
+						if t, ok := t.(*consensus.Transfer); ok {
+							readd = append(readd, t)
+						}
+					}
+				}
+			}
 			if genesis, st, ok := n.Chain.TipState(); ok {
-				n.Pool.Update(genesis, st)
+				n.Pool.Update(genesis, st, readd)
 			}
 		}
 	}

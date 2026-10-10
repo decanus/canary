@@ -126,7 +126,7 @@ func TestPeerSendingInvalidBlockIsBanned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	topic, err := ps.Join("/canary/test/blocks/1.0.0")
+	topic, err := ps.Join("/canary/test/blocks/2.0.0")
 	if err != nil {
 		t.Fatal(err)
 	}

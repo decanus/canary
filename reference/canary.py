@@ -470,6 +470,21 @@ class Block:
                    [bytes.fromhex(t) for t in d["txs"]])
 
 
+MAX_TXS = 1000
+MAX_TX_SIZE = 100_000
+MAX_BLOCK_SIZE = 1_000_000
+
+
+def _compact_size_len(n: int) -> int:
+    return 1 if n < 0xFD else 3 if n <= 0xFFFF else 5 if n <= 0xFFFFFFFF else 9
+
+
+def block_size(blk: "Block") -> int:
+    """Serialized size (§4.2): header ‖ varint(count) ‖ (varint(len) ‖ tx)*."""
+    return (HEADER_SIZE + _compact_size_len(len(blk.txs))
+            + sum(_compact_size_len(len(t)) + len(t) for t in blk.txs))
+
+
 def merkle_root(txs: list) -> bytes:
     layer = [H2(t) for t in txs]
     if not layer:
@@ -705,7 +720,13 @@ def validate_block(chain: list, blk: Block, params: Params = PROTOTYPE,
         raise Invalid(f"bits {h.bits} != required {next_bits(chain, params)}")
     if not (0 <= h.curve_ctr < params.max_curve_ctr):
         raise Invalid("curve_ctr out of range")
-    if not blk.txs or merkle_root(blk.txs) != h.merkle_root:
+    if not (1 <= len(blk.txs) <= MAX_TXS):
+        raise Invalid("tx count out of range")
+    if any(len(t) > MAX_TX_SIZE for t in blk.txs):
+        raise Invalid("tx too large")
+    if block_size(blk) > MAX_BLOCK_SIZE:
+        raise Invalid("block too large")
+    if merkle_root(blk.txs) != h.merkle_root:
         raise Invalid("merkle_root mismatch")
     # timestamps
     if chain:

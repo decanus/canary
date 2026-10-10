@@ -63,21 +63,8 @@ type Vectors struct {
 		Accounts [][3]string `json:"accounts"` // address, balance, nonce
 		Root     string      `json:"root"`
 	} `json:"state_roots"`
-	Transactions []struct {
-		GenesisHash    string `json:"genesis_hash"`
-		Tx             string `json:"tx"`
-		Sender         string `json:"sender"`
-		To             string `json:"to"`
-		Amount         string `json:"amount"`
-		Fee            string `json:"fee"`
-		Nonce          string `json:"nonce"`
-		Digest         string `json:"digest"`
-		ValidSignature bool   `json:"valid_signature"`
-		Coinbase       bool   `json:"coinbase"`
-		Height         uint32 `json:"height"`
-		Extra          string `json:"extra"`
-	} `json:"transactions"`
-	Chain struct {
+	Transactions []TxVector `json:"transactions"`
+	Chain        struct {
 		CumulativeWork string                `json:"cumulative_work"`
 		Supply         string                `json:"supply"`
 		State          [][3]string           `json:"state"`
@@ -92,6 +79,22 @@ type Vectors struct {
 			Reason       string   `json:"reason"`
 		} `json:"cases"`
 	} `json:"invalid_blocks"`
+}
+
+// TxVector is one entry of the "transactions" section: a transfer or a coinbase.
+type TxVector struct {
+	GenesisHash    string `json:"genesis_hash"`
+	Tx             string `json:"tx"`
+	Sender         string `json:"sender"`
+	To             string `json:"to"`
+	Amount         string `json:"amount"`
+	Fee            string `json:"fee"`
+	Nonce          string `json:"nonce"`
+	Digest         string `json:"digest"`
+	ValidSignature bool   `json:"valid_signature"`
+	Coinbase       bool   `json:"coinbase"`
+	Height         uint32 `json:"height"`
+	Extra          string `json:"extra"`
 }
 
 // Result is the outcome of one vector.
@@ -178,8 +181,7 @@ func Run(v *Vectors) []Result {
 		add("state_roots", fmt.Sprintf("#%d (%d accounts)", i, len(c.Accounts)), checkStateRoot(c.Accounts, c.Root))
 	}
 	for i, c := range v.Transactions {
-		add("transactions", fmt.Sprintf("#%d", i), checkTx(c.Tx, c.Coinbase, c.GenesisHash, c.Sender, c.To,
-			c.Amount, c.Fee, c.Nonce, c.Digest, c.ValidSignature, c.Height, c.Extra))
+		add("transactions", fmt.Sprintf("#%d", i), checkTx(c))
 	}
 
 	blocks, err := chainjson.DecodeBlocks(v.Chain.Blocks)
@@ -390,8 +392,8 @@ func checkStateRoot(rows [][3]string, wantRoot string) error {
 	return nil
 }
 
-func checkTx(txHex string, isCoinbase bool, genesisHex, sender, to, amount, fee, nonce, digest string, validSig bool, height uint32, extra string) error {
-	raw, err := hex.DecodeString(txHex)
+func checkTx(c TxVector) error {
+	raw, err := hex.DecodeString(c.Tx)
 	if err != nil {
 		return err
 	}
@@ -399,18 +401,18 @@ func checkTx(txHex string, isCoinbase bool, genesisHex, sender, to, amount, fee,
 	if err != nil {
 		return err
 	}
-	if isCoinbase {
+	if c.Coinbase {
 		cb, ok := tx.(*consensus.Coinbase)
 		if !ok {
 			return errors.New("decoded as a transfer, want coinbase")
 		}
-		if cb.Height != height || hex.EncodeToString(cb.To[:]) != to || hex.EncodeToString(cb.Extra) != extra {
+		if cb.Height != c.Height || hex.EncodeToString(cb.To[:]) != c.To || hex.EncodeToString(cb.Extra) != c.Extra {
 			return errors.New("coinbase fields differ")
 		}
 		if !bytes.Equal(cb.Serialize(), raw) {
 			return errors.New("coinbase does not re-serialize identically")
 		}
-		return wantInt(cb.Amount, amount)
+		return wantInt(cb.Amount, c.Amount)
 	}
 	t, ok := tx.(*consensus.Transfer)
 	if !ok {
@@ -419,26 +421,26 @@ func checkTx(txHex string, isCoinbase bool, genesisHex, sender, to, amount, fee,
 	if !bytes.Equal(t.Serialize(), raw) {
 		return errors.New("transfer does not re-serialize identically")
 	}
-	genesis, err := parseHash(genesisHex)
+	genesis, err := parseHash(c.GenesisHash)
 	if err != nil {
 		return err
 	}
-	if d := t.Digest(genesis); hex.EncodeToString(d[:]) != digest {
-		return fmt.Errorf("digest %x, want %s", d, digest)
+	if d := t.Digest(genesis); hex.EncodeToString(d[:]) != c.Digest {
+		return fmt.Errorf("digest %x, want %s", d, c.Digest)
 	}
-	if got := t.VerifySignature(genesis); got != validSig {
-		return fmt.Errorf("signature valid = %v, want %v", got, validSig)
+	if got := t.VerifySignature(genesis); got != c.ValidSignature {
+		return fmt.Errorf("signature valid = %v, want %v", got, c.ValidSignature)
 	}
-	if sender == "" {
+	if c.Sender == "" {
 		return nil // corrupted-signature case: only the signature result is specified
 	}
-	if s := t.Sender(); hex.EncodeToString(s[:]) != sender || hex.EncodeToString(t.To[:]) != to {
+	if s := t.Sender(); hex.EncodeToString(s[:]) != c.Sender || hex.EncodeToString(t.To[:]) != c.To {
 		return errors.New("sender or recipient differs")
 	}
-	if strconv.FormatUint(t.Nonce, 10) != nonce {
-		return fmt.Errorf("nonce %d, want %s", t.Nonce, nonce)
+	if strconv.FormatUint(t.Nonce, 10) != c.Nonce {
+		return fmt.Errorf("nonce %d, want %s", t.Nonce, c.Nonce)
 	}
-	return errors.Join(wantInt(t.Amount, amount), wantInt(t.Fee, fee))
+	return errors.Join(wantInt(t.Amount, c.Amount), wantInt(t.Fee, c.Fee))
 }
 
 func checkInvalid(p *consensus.Params, base consensus.Headers, parent consensus.State, headerHex string, hexTxs []string) error {

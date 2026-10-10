@@ -54,9 +54,7 @@ func ValidateBlock(p *Params, chain ChainView, parent State, blk *Block, now *in
 		return fail(invalid("curve_ctr out of range"))
 	}
 
-	// 4. transactions and merkle root.
-	// SPEC: the reference checks only non-emptiness and the merkle root; the §4.2 size limits are
-	// enforced here as well so that blocks that cannot be serialized are never accepted.
+	// 4. transactions: the §4.2 limits, then the merkle root.
 	if err := checkTxCount(uint64(len(blk.Txs))); err != nil {
 		return fail(invalid("%v", err))
 	}

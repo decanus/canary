@@ -42,7 +42,7 @@ func (h *Header) PreHeader() []byte {
 	return append(b, n[:]...)
 }
 
-// Serialize returns the 144-byte header encoding.
+// Serialize returns the 176-byte header encoding.
 func (h *Header) Serialize() []byte {
 	k := le32(h.K)
 	return append(h.PreHeader(), k[:]...)

@@ -145,7 +145,7 @@ lengths are exact, and unknown `kind` or `scheme` values, or trailing bytes, are
 7 856 B). `address = H(tag("addr") ‖ u8 scheme ‖ pubkey)` (32 bytes). The scheme byte leaves room
 for future schemes; it is part of the address so the same key bytes can never mean two things.
 
-**Coinbase** (`kind = 0`), exactly once, as `txs[0]` (55–119 bytes):
+**Coinbase** (`kind = 0`), exactly once, as `txs[0]` (54–118 bytes):
 `u8 kind=0 ‖ u32 height ‖ 32B to ‖ u128 amount ‖ u8 extraLen ‖ extra` with `extraLen ≤ 64`.
 `height` must equal the block height. The recipient binds to the puzzle via `merkle_root` →
 `preHeader` → `P`, which is what makes a broadcast `k` unstealable.
@@ -315,30 +315,32 @@ fast path using fixed-width arithmetic (e.g. `math/bits` 128-bit Montgomery for 
   state they mine on.
 
 ## 9. P2P (libp2p)
-Networking uses go-libp2p (TCP and QUIC transports, Noise, yamux) and go-libp2p-pubsub. This is
+Networking uses go-libp2p (TCP and QUIC transports, Noise, yamux) and go-libp2p-pubsub. Protocol
+and topic versions (`2.0.0`, status `version = 2`) follow the header version, so nodes with
+incompatible block formats never exchange blocks. This is
 the justified third-party dependency of §1; nothing in `internal/consensus` depends on it. `<net>`
 below is the network name from §2, so nodes of different networks never exchange messages.
 
 - **Identity.** A persistent Ed25519 key in `<datadir>/node.key`. Peer IDs are not a trust
   boundary (§9.1).
-- **Status** `/canary/<net>/status/1.0.0`: the dialer opens a stream on every new connection and
+- **Status** `/canary/<net>/status/2.0.0`: the dialer opens a stream on every new connection and
   writes its status; the listener replies with its own. Status =
   `u32le version ‖ u32le height ‖ 32B tipHash ‖ u8 len ‖ cumulativeWork (big-endian, len bytes)`,
   where height is the active chain length. Whichever side sees more cumulative work on the other
   starts a sync. Nodes repeat the exchange with every peer periodically (default 15 s) to catch
   blocks missed by gossip.
-- **Sync** `/canary/<net>/sync/1.0.0`: the requester writes a block locator
+- **Sync** `/canary/<net>/sync/2.0.0`: the requester writes a block locator
   `u8 count ‖ count × 32B hash` (newest first: the last 10 active blocks, then exponentially
   sparser back to genesis, at most 32) and closes its write side. The responder finds the first
   locator hash on its active chain and replies `u32le count ‖ count × (u32le len ‖ block)` with
   the active blocks after it (from genesis if none match), at most 500 blocks and 8 MB. The
   requester repeats while it receives full batches that make progress.
-- **Gossip.** GossipSub topic `/canary/<net>/blocks/1.0.0`; a message is one serialized block and
+- **Gossip.** GossipSub topic `/canary/<net>/blocks/2.0.0`; a message is one serialized block and
   its message ID is `SHA-256(data)`, so the same block from different publishers is one message.
   The topic validator runs `AddBlock`: invalid → reject and ban the sender; unknown parent → ignore
   and sync from the sender; duplicate → ignore; otherwise accept (and forward). A node publishes
   every block it mines.
-- **Transactions.** GossipSub topic `/canary/<net>/txs/1.0.0`; a message is one serialized
+- **Transactions.** GossipSub topic `/canary/<net>/txs/2.0.0`; a message is one serialized
   transfer. The validator adds it to the mempool: bad encoding or signature → reject and ban the
   sender; state-dependent failures (nonce, balance, pool full) → ignore, since honest nodes can
   briefly disagree about state; otherwise accept and forward.

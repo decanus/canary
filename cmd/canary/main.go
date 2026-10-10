@@ -35,9 +35,9 @@ commands:
                    create an SLH-DSA key, print its address
   address --key FILE
                    print a key's address
-  balance [--api URL] ADDR
+  balance [--api URL | --profile P] ADDR
                    show an account's balance and nonce
-  send --key FILE --to ADDR --amount N [--fee N] [--api URL]
+  send --key FILE --to ADDR --amount N [--fee N] [--api URL | --profile P]
                    sign a transfer (takes a few seconds) and submit it to a node
   verify FILE      validate a chain JSON file and print its cumulative work
   mine --chain FILE [--blocks N] [--threads N] [--miner-address STR] [--profile prototype|mainnet]
@@ -192,9 +192,7 @@ func runMine(args []string) error {
 		if err != nil {
 			return err
 		}
-		if state, _, err = consensus.ValidateBlock(p, headers, state, res.Block, nil); err != nil {
-			return err
-		}
+		state = res.State
 		blocks = append(blocks, res.Block)
 		headers = append(headers, res.Block.Header)
 		if err := chainjson.Save(*chainPath, p, blocks); err != nil {
@@ -339,7 +337,22 @@ func runKeygen(args []string) error {
 	return nil
 }
 
-const defaultAPI = "http://127.0.0.1:18556"
+// apiFlag registers --api and --profile; the returned function resolves the API URL, defaulting
+// to the profile's local API port.
+func apiFlag(fset *flag.FlagSet) func() (string, error) {
+	apiURL := fset.String("api", "", "node API URL (default http://127.0.0.1:<profile API port>)")
+	profile := fset.String("profile", "prototype", "network: prototype or mainnet")
+	return func() (string, error) {
+		if *apiURL != "" {
+			return *apiURL, nil
+		}
+		p, err := profileParams(*profile)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("http://127.0.0.1:%d", p.APIPort), nil
+	}
+}
 
 func runAddress(args []string) error {
 	fset := flag.NewFlagSet("address", flag.ExitOnError)
@@ -359,7 +372,7 @@ func runAddress(args []string) error {
 
 func runBalance(args []string) error {
 	fset := flag.NewFlagSet("balance", flag.ExitOnError)
-	apiURL := fset.String("api", defaultAPI, "node API URL")
+	apiURL := apiFlag(fset)
 	fset.Parse(args)
 	if fset.NArg() != 1 {
 		return errors.New("usage: canary balance [--api URL] ADDR")
@@ -368,7 +381,11 @@ func runBalance(args []string) error {
 	if err != nil {
 		return err
 	}
-	acc, err := api.NewClient(*apiURL).Account(addr)
+	url, err := apiURL()
+	if err != nil {
+		return err
+	}
+	acc, err := api.NewClient(url).Account(addr)
 	if err != nil {
 		return err
 	}
@@ -382,7 +399,7 @@ func runSend(args []string) error {
 	toHex := fset.String("to", "", "recipient address (required)")
 	amountStr := fset.String("amount", "", "amount in base units (required)")
 	feeStr := fset.String("fee", "0", "fee in base units, paid to the miner")
-	apiURL := fset.String("api", defaultAPI, "node API URL")
+	apiURL := apiFlag(fset)
 	fset.Parse(args)
 	if *keyPath == "" || *toHex == "" || *amountStr == "" {
 		return errors.New("usage: canary send --key FILE --to ADDR --amount N [--fee N] [--api URL]")
@@ -401,7 +418,11 @@ func runSend(args []string) error {
 		return errors.New("amount and fee must be non-negative integers below 2^128")
 	}
 
-	client := api.NewClient(*apiURL)
+	url, err := apiURL()
+	if err != nil {
+		return err
+	}
+	client := api.NewClient(url)
 	tip, err := client.Tip()
 	if err != nil {
 		return err

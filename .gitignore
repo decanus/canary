@@ -1,3 +1,4 @@
 /canary
 *.test
 .genlog
+__pycache__/

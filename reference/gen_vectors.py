@@ -160,6 +160,10 @@ def invalid_section(chain, states, keys, signed):
     mutate("no_coinbase", lambda b: b.txs.pop(0), remerkle=True)
     mutate("two_coinbases", lambda b: b.txs.append(b.txs[0]), remerkle=True)
     mutate("truncated_transfer", lambda b: b.txs.__setitem__(1, b.txs[1][:-1]), remerkle=True)
+    # §4.2 limits (rule 4): no valid signatures or funds are needed to hit them.
+    mutate("too_many_txs", lambda b: b.txs.extend([b"\x01"] * 1000), remerkle=True)
+    mutate("tx_too_large", lambda b: b.txs.append(b"\x01" * 100_001), remerkle=True)
+    mutate("block_too_large", lambda b: b.txs.extend([b.txs[1]] * 125), remerkle=True)
 
     # Genesis must not contain transfers (rule 8: no mining needed).
     g = copy.deepcopy(chain[0])

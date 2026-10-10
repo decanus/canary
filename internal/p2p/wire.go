@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	// ProtocolVersion is sent in status messages.
-	ProtocolVersion = 1
+	// ProtocolVersion is sent in status messages. It tracks the block format (v0.2 = header
+	// version 2), as do the /2.0.0 protocol and topic IDs, so nodes of different formats never
+	// exchange blocks.
+	ProtocolVersion = 2
 	// MaxSyncBlocks is the most blocks one sync response carries.
 	MaxSyncBlocks = 500
 	// maxSyncBytes bounds a sync response's total size.
@@ -30,19 +32,19 @@ var syncBatch = MaxSyncBlocks
 
 // Protocol IDs and topic names are namespaced by network, so different networks never mix.
 func statusProtocol(network string) protocol.ID {
-	return protocol.ID("/canary/" + network + "/status/1.0.0")
+	return protocol.ID("/canary/" + network + "/status/2.0.0")
 }
 
 func syncProtocol(network string) protocol.ID {
-	return protocol.ID("/canary/" + network + "/sync/1.0.0")
+	return protocol.ID("/canary/" + network + "/sync/2.0.0")
 }
 
 func blocksTopic(network string) string {
-	return "/canary/" + network + "/blocks/1.0.0"
+	return "/canary/" + network + "/blocks/2.0.0"
 }
 
 func txsTopic(network string) string {
-	return "/canary/" + network + "/txs/1.0.0"
+	return "/canary/" + network + "/txs/2.0.0"
 }
 
 // Status describes a node's active chain: u32le version ‖ u32le height ‖ tip hash ‖
