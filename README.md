@@ -10,8 +10,8 @@ the bit-size `b` of the curve's prime group order `n`. Because the cost of the b
 how large a discrete log the network can solve per block interval. It's a canary for ECDLP
 capacity, and `256 − b` is the distance to secp256k1.
 
-> **Status:** prototype, milestones M1–M3 of 5 are done (consensus library, offline mining,
-> storage and chain manager). Networking (M4) and the HTTP API (M5) are next. There are no transactions,
+> **Status:** prototype, milestones M1–M4 of 5 are done (consensus library, offline mining,
+> storage and chain manager, libp2p networking). The HTTP API (M5) is next. There are no transactions,
 > coins or wallets; a block carries opaque byte strings. Not for production use.
 
 ## How it works
@@ -37,19 +37,21 @@ internal/miner/          curve search (2-torsion filter + baby-step giant-step o
                         parallel Pollard rho with distinguished points
 internal/chain/          append-only block store, block tree with side chains, fork choice by
                         cumulative work, reorgs, orphan pool, tip-change events
+internal/p2p/            libp2p networking: status and sync protocols, GossipSub block relay, bans
+internal/node/           full node: chain + p2p + mining loop
 internal/chainjson/     chain JSON format shared with the Python reference
 internal/conformance/   runner for reference/test_vectors.json
 reference/              Python reference implementation (the consensus oracle) and vectors
 SPEC.md                 build spec, the source of truth
 ```
 
-Consensus code is standard library only, uses deterministic integer arithmetic and no
+Consensus code is standard library only (libp2p is used only for networking), uses deterministic integer arithmetic and no
 `big.Int.ProbablyPrime`, because Go's BPSW uses a different Lucas test from the consensus one
 (see SPEC.md §3.3).
 
 ## Usage
 
-Requires Go 1.22+. The Python reference needs Python 3.8+ and no dependencies.
+Requires Go 1.25.7+. The Python reference needs Python 3.8+ and no dependencies.
 
 ```sh
 go test ./...                                    # unit, vector and fuzz-seed tests
@@ -61,6 +63,17 @@ go run ./cmd/canary export --datadir DIR out.json         # dump a node's active
 python3 reference/canary.py mine chain.json -n 5 # mine with the reference miner
 python3 reference/canary.py verify chain.json    # cross-check with the reference
 ```
+
+Running a network:
+
+```sh
+canary node --mine                               # prints its /ip4/.../p2p/<id> addresses
+canary node --peers /ip4/1.2.3.4/tcp/18555/p2p/12D3Koo...
+```
+
+Nodes speak libp2p (TCP and QUIC). They find each other through `--peers` and remember
+peers in `peers.json`. New blocks spread by GossipSub; nodes that fall behind catch up with a
+locator-based sync protocol. A peer that sends an invalid block is banned for 10 minutes.
 
 Fuzzing:
 
@@ -93,7 +106,7 @@ take `--profile`.
 - [x] **M1** Consensus library, passing all reference vectors
 - [x] **M2** Offline mining (curve search + parallel Pollard rho) and JSON interop with the reference
 - [x] **M3** Block storage, chain manager, reorgs
-- [ ] **M4** TCP peer-to-peer block relay
+- [x] **M4** Peer-to-peer block relay over libp2p
 - [ ] **M5** Local HTTP API with benchmark stats
 
 ## Mining performance
@@ -102,6 +115,14 @@ On a 10-core laptop with `math/big` arithmetic, a 36-bit block takes about 1s (c
 under 0.25s, rho the rest). Rho costs about √(πn/4) group operations, so each extra 2 bits of
 difficulty roughly doubles solve time. A fixed-width fast path for p < 2^63 (SPEC §6.3) hasn't
 been needed yet.
+
+## Cryptography and quantum resistance
+
+Consensus relies only on SHA-256, which keeps about 128-bit security against quantum attackers.
+Peer identities (Ed25519) and transport encryption are classical. That's deliberate: they protect
+nothing consensus-critical, because every block is validated regardless of who sent it. When
+transactions are added, they'll use post-quantum signatures from day one. A chain that measures
+progress toward breaking elliptic curves shouldn't secure its own coins with them. See SPEC §9.1.
 
 ## Known limitations
 

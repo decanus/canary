@@ -418,3 +418,22 @@ func (m *Manager) NumOrphans() int {
 	defer m.mu.RUnlock()
 	return len(m.orphans)
 }
+
+// Locator returns active-chain hashes for a sync request, newest first: the last 10 blocks,
+// then exponentially sparser back to genesis, at most 32 in all.
+func (m *Manager) Locator() [][32]byte {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out [][32]byte
+	step := 1
+	for h := len(m.active) - 1; h >= 0 && len(out) < 31; h -= step {
+		out = append(out, m.active[h].hash)
+		if len(out) >= 10 {
+			step *= 2
+		}
+	}
+	if len(m.active) > 0 && out[len(out)-1] != m.active[0].hash {
+		out = append(out, m.active[0].hash)
+	}
+	return out
+}

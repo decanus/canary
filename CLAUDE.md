@@ -11,6 +11,7 @@ source of truth.
   `reference/test_vectors.json` is canonical. Never edit them to make tests pass.
   (The vectors were regenerated once on 2026-10-10 for the ECPoW → Canary rename of the `tag()`
   prefix; that file is now canonical.)
+- Networking uses libp2p (`internal/p2p`); `internal/consensus` must never import it.
 - Consensus code (`internal/consensus`) uses only the Go standard library, integer math, and no
   randomness. Never use `big.Int.ProbablyPrime` there (SPEC.md §3.3).
 - If SPEC.md is ambiguous, match the Python reference and leave a `// SPEC:` comment explaining it.

@@ -20,8 +20,9 @@ type Params struct {
 	MTPWindow     int64  `json:"mtp_window"`     // median-time-past window
 	FutureLimit   int64  `json:"future_limit"`   // max seconds ahead of the local clock
 
-	// Network settings; not consensus and not part of the chain JSON.
-	Magic   uint32 `json:"-"`
+	// Network settings; not consensus and not part of the chain JSON. Network names the libp2p
+	// protocol IDs and gossip topic, so nodes of different networks never talk.
+	Network string `json:"-"`
 	P2PPort int    `json:"-"`
 	APIPort int    `json:"-"`
 }
@@ -38,7 +39,7 @@ var Prototype = Params{
 	TimewarpSlack: 600,
 	MTPWindow:     11,
 	FutureLimit:   7200,
-	Magic:         0xCA4A2701,
+	Network:       "prototype",
 	P2PPort:       18555,
 	APIPort:       18556,
 }
@@ -47,7 +48,7 @@ var Prototype = Params{
 var Mainnet = func() Params {
 	p := Prototype
 	p.Tau, p.Epoch, p.GenesisBits = 600, 2016, 64
-	p.Magic, p.P2PPort, p.APIPort = 0xCA4A2700, 8555, 8556
+	p.Network, p.P2PPort, p.APIPort = "mainnet", 8555, 8556
 	return p
 }()
 
@@ -55,8 +56,8 @@ var Mainnet = func() Params {
 // are ignored).
 func (p *Params) SameConsensus(q *Params) bool {
 	a, b := *p, *q
-	a.Magic, a.P2PPort, a.APIPort = 0, 0, 0
-	b.Magic, b.P2PPort, b.APIPort = 0, 0, 0
+	a.Network, a.P2PPort, a.APIPort = "", 0, 0
+	b.Network, b.P2PPort, b.APIPort = "", 0, 0
 	return a == b
 }
 

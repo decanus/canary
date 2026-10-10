@@ -19,7 +19,7 @@ mining, verifying chains and running conformance tests.
 - Consensus library (header format, curve derivation, puzzle, difficulty, validation).
 - Chain storage, fork choice by cumulative work, reorgs.
 - Parallel Pollard-rho miner.
-- Simple TCP peer-to-peer block relay.
+- Peer-to-peer block relay over libp2p (§9).
 - Local HTTP JSON API with benchmark stats.
 - Conformance against `reference/test_vectors.json`.
 
@@ -31,7 +31,7 @@ mining, verifying chains and running conformance tests.
 
 ## 1. Ground rules for the implementer
 
-1. **Go 1.22+, standard library only** for everything consensus (`crypto/sha256`, `math/big`,
+1. **Go 1.25.7+ (required by go-libp2p), standard library only** for everything consensus (`crypto/sha256`, `math/big`,
    `encoding/binary`). Third-party deps are allowed only outside `internal/consensus`, and only if
    clearly justified.
 2. **Consensus code is deterministic integer arithmetic.** No floats, no randomness, no map-iteration
@@ -56,7 +56,7 @@ mining, verifying chains and running conformance tests.
 | `TimewarpSlack` | 600 s | 600 s | See §5 |
 | `MTPWindow` | 11 | 11 | Median-time-past window |
 | `FutureLimit` | 7200 s | 7200 s | Max seconds ahead of local clock (live blocks only) |
-| Network magic | `0xCA4A2701` | `0xCA4A2700` | P2P framing (§9) |
+| Network name | `prototype` | `mainnet` | Namespaces libp2p protocol IDs and the gossip topic (§9) |
 | Default P2P port | 18555 | 8555 | |
 | Default API port | 18556 | 8556 | |
 
@@ -231,7 +231,10 @@ fast path using fixed-width arithmetic (e.g. `math/bits` 128-bit Montgomery for 
 
 ## 7. Storage
 - Data dir layout: `<datadir>/blocks.dat` (append-only, records = `u32le(len) ‖ block bytes`),
-  `<datadir>/peers.json`.
+  `<datadir>/params.json` (the consensus params the directory was created with; opening it with
+  different params is an error), `<datadir>/node.key` (libp2p identity), `<datadir>/peers.json`.
+- A torn final record (short, or zero-filled after power loss) is truncated on startup; any other
+  undecodable record is corruption.
 - On startup, replay `blocks.dat` through validation (skip rule 7) to rebuild the block index.
 - Block index in memory: `hash → {header, height, cumulativeWork, parent}`; keep side-chain blocks so
   reorgs work. Persist every valid block, including side-chain ones.
@@ -242,17 +245,48 @@ fast path using fixed-width arithmetic (e.g. `math/bits` 128-bit Montgomery for 
   to it. Then try connecting orphans whose parent is now known.
 - Emit tip-change events (miner restarts, API, P2P announce).
 
-## 9. P2P (minimal)
-- TCP, frames: `magic u32le ‖ type u8 ‖ len u32le ‖ payload`. Max payload 2 MB.
-- Messages:
-  - `0x01 hello`: `u32le version ‖ u32le height ‖ 32B tipHash ‖ u16le listenPort`.
-  - `0x02 getblocks`: `32B locatorHash` → peer sends blocks after that hash on its active chain, up to 500.
-    Locator = own tip hash; if unknown to the peer, it starts from genesis.
-  - `0x03 block`: serialized block.
-  - `0x04 inv`: `32B blockHash` (announce new tip).
-  - `0x05 ping` / `0x06 pong`: `u64le nonce`.
-- On connect: exchange `hello`; if peer height > ours, send `getblocks`. On `inv` of an unknown hash, send `getblocks`.
-- Ban (disconnect + 10 min) a peer that sends an invalid block. Max 16 peers. Static `--peers` list plus peers from `peers.json`.
+## 9. P2P (libp2p)
+Networking uses go-libp2p (TCP and QUIC transports, Noise, yamux) and go-libp2p-pubsub. This is
+the justified third-party dependency of §1; nothing in `internal/consensus` depends on it. `<net>`
+below is the network name from §2, so nodes of different networks never exchange messages.
+
+- **Identity.** A persistent Ed25519 key in `<datadir>/node.key`. Peer IDs are not a trust
+  boundary (§9.1).
+- **Status** `/canary/<net>/status/1.0.0`: the dialer opens a stream on every new connection and
+  writes its status; the listener replies with its own. Status =
+  `u32le version ‖ u32le height ‖ 32B tipHash ‖ u8 len ‖ cumulativeWork (big-endian, len bytes)`,
+  where height is the active chain length. Whichever side sees more cumulative work on the other
+  starts a sync. Nodes repeat the exchange with every peer periodically (default 15 s) to catch
+  blocks missed by gossip.
+- **Sync** `/canary/<net>/sync/1.0.0`: the requester writes a block locator
+  `u8 count ‖ count × 32B hash` (newest first: the last 10 active blocks, then exponentially
+  sparser back to genesis, at most 32) and closes its write side. The responder finds the first
+  locator hash on its active chain and replies `u32le count ‖ count × (u32le len ‖ block)` with
+  the active blocks after it (from genesis if none match), at most 500 blocks and 8 MB. The
+  requester repeats while it receives full batches that make progress.
+- **Gossip.** GossipSub topic `/canary/<net>/blocks/1.0.0`; a message is one serialized block and
+  its message ID is `SHA-256(data)`, so the same block from different publishers is one message.
+  The topic validator runs `AddBlock`: invalid → reject and ban the sender; unknown parent → ignore
+  and sync from the sender; duplicate → ignore; otherwise accept (and forward). A node publishes
+  every block it mines.
+- **Peers.** Ban (disconnect, refuse connections for 10 min) any peer that sends an invalid block or
+  undecodable block bytes via gossip or sync. Max 16 peers (connection manager, and inbound
+  connections refused at the limit). Static `--peers` multiaddrs plus the addresses saved in
+  `peers.json` at shutdown; static peers are redialled when the node has no connections. Liveness
+  uses libp2p's built-in ping.
+
+### 9.1 Cryptographic assumptions
+- Consensus security rests on SHA-256 only (hashing, merkle roots, curve and puzzle derivation).
+  Grover's algorithm leaves about 128-bit preimage security, which is sufficient. The puzzle curves are
+  meant to be broken and are not a security assumption.
+- P2P identities (Ed25519) and transport key exchange are classical and quantum-vulnerable; go-libp2p
+  offers no post-quantum key type. This is acceptable because they protect nothing consensus-critical:
+  every block is validated regardless of sender, bans are only DoS mitigation, and relayed data is
+  public.
+- **Future transactions must use post-quantum signatures from day one** (e.g. SLH-DSA / FIPS 205,
+  which relies only on hash security, or ML-DSA / FIPS 204). A chain that measures progress towards
+  breaking elliptic curves must not secure its own coins with them. The current block and transaction
+  size limits (§4.2) will need revisiting for those signature sizes.
 
 ## 10. HTTP API (localhost only by default)
 | Method | Path | Returns |
@@ -274,8 +308,9 @@ fast path using fixed-width arithmetic (e.g. `math/bits` 128-bit Montgomery for 
 
 ## 12. CLI
 ```
-canary node    [--datadir DIR] [--listen :18555] [--api 127.0.0.1:18556] [--peers h:p,...]
-              [--mine] [--miner-address STR] [--threads N] [--profile prototype|mainnet]
+canary node    [--datadir DIR] [--listen MULTIADDR,...] [--api 127.0.0.1:18556]
+              [--peers MULTIADDR/p2p/ID,...] [--mine] [--miner-address STR] [--threads N]
+              [--profile prototype|mainnet]
 canary mine    --chain FILE.json [--blocks N] [--threads N] [--miner-address STR]   # offline, like reference
 canary verify  FILE.json                                                             # prints cumulative work
 canary export  --datadir DIR FILE.json
@@ -289,7 +324,8 @@ internal/consensus/   params.go hash.go prime.go curve.go h2c.go header.go block
                       difficulty.go validate.go work.go  (+ *_test.go, vectors_test.go)
 internal/miner/       curvesearch.go rho.go miner.go
 internal/chain/       index.go manager.go store.go
-internal/p2p/         wire.go peer.go server.go
+internal/p2p/         wire.go gater.go identity.go node.go
+internal/node/        node.go   (chain + p2p + mining loop)
 internal/api/         server.go
 internal/chainjson/   format.go
 reference/            canary.py gen_vectors.py test_vectors.json   (do not modify)

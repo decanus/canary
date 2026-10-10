@@ -9,7 +9,10 @@ import (
 	"io/fs"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/decanus/canary/internal/chain"
@@ -17,6 +20,8 @@ import (
 	"github.com/decanus/canary/internal/conformance"
 	"github.com/decanus/canary/internal/consensus"
 	"github.com/decanus/canary/internal/miner"
+	"github.com/decanus/canary/internal/node"
+	"github.com/decanus/canary/internal/p2p"
 )
 
 const usage = `usage: canary <command> [args]
@@ -28,7 +33,9 @@ commands:
                    mine blocks onto a chain JSON file (created if missing), offline
   export --datadir DIR FILE
                    write a node's active chain as chain JSON (read-only)
-  node             not implemented yet (milestones M4–M5)
+  node [--datadir DIR] [--listen ADDRS] [--peers ADDRS] [--mine] [--miner-address STR]
+       [--threads N] [--profile prototype|mainnet]
+                   run a full node (libp2p networking, optional mining)
 `
 
 func main() {
@@ -47,7 +54,7 @@ func main() {
 	case "export":
 		err = runExport(args)
 	case "node":
-		err = fmt.Errorf("%s: not implemented yet", cmd)
+		err = runNode(args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -203,4 +210,66 @@ func runExport(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "exported %d blocks\n", len(blocks))
 	return nil
+}
+
+func runNode(args []string) error {
+	fset := flag.NewFlagSet("node", flag.ExitOnError)
+	profile := fset.String("profile", "prototype", "network: prototype or mainnet")
+	datadir := fset.String("datadir", "", "data directory (default ~/.canary/<profile>)")
+	listen := fset.String("listen", "", "comma-separated listen multiaddrs (default TCP and QUIC on the profile's port)")
+	peers := fset.String("peers", "", "comma-separated peer multiaddrs ending in /p2p/<id>")
+	mine := fset.Bool("mine", false, "mine blocks")
+	minerAddr := fset.String("miner-address", "miner-address", "miner identity in the coinbase")
+	threads := fset.Int("threads", runtime.NumCPU(), "rho worker goroutines")
+	fset.Parse(args)
+
+	p, err := profileParams(*profile)
+	if err != nil {
+		return err
+	}
+	if *datadir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		*datadir = filepath.Join(home, ".canary", p.Network)
+	}
+	listenAddrs := splitList(*listen)
+	if len(listenAddrs) == 0 {
+		listenAddrs = []string{
+			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", p.P2PPort),
+			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", p.P2PPort),
+		}
+	}
+
+	n, err := node.Open(node.Config{
+		DataDir:      *datadir,
+		Params:       p,
+		P2P:          p2p.Config{Listen: listenAddrs, Peers: splitList(*peers)},
+		Mine:         *mine,
+		MinerAddress: *minerAddr,
+		Threads:      *threads,
+	})
+	if err != nil {
+		return err
+	}
+	defer n.Close()
+	fmt.Fprintf(os.Stderr, "canary %s node, datadir %s, %d blocks\n", p.Network, *datadir, n.Chain.Height())
+	for _, a := range n.P2P.Addrs() {
+		fmt.Fprintf(os.Stderr, "listening on %s\n", a)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return n.Run(ctx)
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }

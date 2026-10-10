@@ -15,23 +15,32 @@ defaults:
 
 jobs:
   test:
-    name: Go ${{ matrix.go }}
+    name: Go ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.22.x", "stable"]
+        include:
+          - name: minimum (go.mod)
+            go-version-file: go.mod
+          - name: stable
+            go-version: stable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go }}
+          go-version: ${{ matrix.go-version }}
+          go-version-file: ${{ matrix.go-version-file }}
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: go vet
         run: go vet ./...
+      - name: Consensus imports only the standard library
+        run: |
+          deps=$(go list -deps -f '{{if not .Standard}}{{.ImportPath}}{{end}}' ./internal/consensus | grep -v '^github.com/decanus/canary/internal/consensus$' || true)
+          test -z "$deps" || { echo "non-stdlib imports in internal/consensus:"; echo "$deps"; exit 1; }
       - name: go test
-        run: go test -race ./...
+        run: go test -race -timeout 10m ./...
       - name: Conformance vectors
         run: go run ./cmd/canary vectors
 
