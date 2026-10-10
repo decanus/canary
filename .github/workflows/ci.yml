@@ -61,3 +61,8 @@ jobs:
           python3 reference/canary.py verify chain.json | tee py.txt
           go run ./cmd/canary verify chain.json | tee go.txt
           diff py.txt go.txt
+      - name: Mine with Go, verify with Python
+        run: |
+          go run ./cmd/canary mine --chain mined.json --blocks 5 --genesis-bits 32 --epoch 4
+          python3 reference/canary.py verify mined.json
+          go run ./cmd/canary verify mined.json
